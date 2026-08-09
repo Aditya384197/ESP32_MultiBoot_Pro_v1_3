@@ -28,10 +28,13 @@
  * ║  CUSTOM PARTITION TABLE (partitions_multiboot.csv):                    ║
  * ║  nvs,     data, nvs,     0x9000,   0x5000                             ║
  * ║  otadata, data, ota,     0xe000,   0x2000                             ║
- * ║  manager, app,  factory, 0x10000,  0xF0000   ← THIS firmware (960KB) ║
- * ║  slot_a,  app,  ota_0,   0x100000, 0x130000  ← Persistent slot A     ║
- * ║  slot_b,  app,  ota_1,   0x230000, 0x130000  ← Persistent slot B     ║
- * ║  spiffs,  data, spiffs,  0x360000, 0x28000   ← Config/log (160KB)   ║
+ * ║  manager, app,  factory, 0x10000,  0x100000 ← THIS firmware (1024KB) ║
+ * ║  slot_a,  app,  ota_0,   0x110000, 0x130000  ← Persistent slot A     ║
+ * ║  slot_b,  app,  ota_1,   0x240000, 0x130000  ← Persistent slot B     ║
+ * ║  spiffs,  data, spiffs,  0x370000, 0x28000   ← Config/log (160KB)   ║
+ * ║  (Grown from the original 960KB factory slot — the compiled manager  ║
+ * ║  binary is ~1010KB, so 960KB overflowed by ~49KB. All partitions     ║
+ * ║  after 'manager' shifted by +64KB to compensate; still fits in 4MB.) ║
  * ║                                                                        ║
  * ║  LIBRARIES (all built-in with ESP32 Arduino Core):                     ║
  * ║  WiFi, WebServer, SD, SPI, Update, Preferences, SPIFFS                ║
