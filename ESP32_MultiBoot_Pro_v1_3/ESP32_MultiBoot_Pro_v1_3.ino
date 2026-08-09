@@ -237,6 +237,7 @@
 // ═══════════════════════════════════════════════════════════════════════════
 #include <WiFi.h>
 #include <WebServer.h>
+#include <DNSServer.h>
 #include <SD.h>
 #include <SPI.h>
 #include <Update.h>
@@ -330,6 +331,7 @@ const char* AP_PASS         = "bootmgr-ap-2026";
 #define BINARIES_DIR     "/binaries"
 #define OTA_MAGIC_BYTE   0xE9        // Valid ESP32 image first byte
 #define FLASH_BUF_SIZE   4096        // Read buffer for SD→Flash streaming
+#define DNS_PORT         53          // Captive-portal DNS (AP mode only)
 
 // Boot targets stored in NVS
 #define TARGET_MANAGER "manager"
@@ -340,6 +342,7 @@ const char* AP_PASS         = "bootmgr-ap-2026";
 //   GLOBALS
 // ═══════════════════════════════════════════════════════════════════════════
 WebServer   server(80);
+DNSServer   dnsServer;   // Captive portal: only started/serviced in AP mode
 Preferences prefs;
 bool        sdReady        = false;
 bool        apMode         = false;
@@ -716,8 +719,16 @@ h1{font-size:1.5rem;font-weight:900;letter-spacing:3px;text-transform:uppercase;
   <button class="btn btn-success btn-lg" id="btnUpload" onclick="uploadFile()" disabled>
     Upload to SD Card
   </button>
+  <div style="display:flex;gap:.6rem;margin-top:.6rem">
+    <button class="btn btn-lg" id="btnUploadFlashA" onclick="uploadFile('a')" disabled style="flex:1">
+      ⚡ Upload &amp; Flash → Slot A
+    </button>
+    <button class="btn btn-lg" id="btnUploadFlashB" onclick="uploadFile('b')" disabled style="flex:1">
+      ⚡ Upload &amp; Flash → Slot B
+    </button>
+  </div>
   <div class="tip">
-    ℹ Uploads go to SD card only. To flash into a slot, use the buttons above after uploading.
+    ℹ "Upload to SD Card" only stores the file for later. "Upload &amp; Flash" does both in one step from any connected device (phone included) — no separate Flash click needed — and reboots into that slot when done.
   </div>
 </div>
 
@@ -764,6 +775,8 @@ var dz = document.getElementById('dropZone');
 var fi = document.getElementById('fileInput');
 var dzFname = document.getElementById('dzFname');
 var btnUpload = document.getElementById('btnUpload');
+var btnUploadFlashA = document.getElementById('btnUploadFlashA');
+var btnUploadFlashB = document.getElementById('btnUploadFlashB');
 
 function setFile(file){
   if(!file) return;
@@ -775,6 +788,8 @@ function setFile(file){
   dzFname.textContent = file.name + '  (' + (file.size/1024).toFixed(1) + ' KB)';
   dzFname.style.display = 'block';
   btnUpload.disabled = false;
+  btnUploadFlashA.disabled = false;
+  btnUploadFlashB.disabled = false;
 }
 fi.addEventListener('change', function(){ setFile(fi.files[0]); });
 dz.addEventListener('click', function(){ fi.click(); });
@@ -785,8 +800,18 @@ dz.addEventListener('drop', function(e){
   setFile(e.dataTransfer.files[0]);
 });
 
-// ── Upload to SD ──────────────────────────────────────────────────────────
-function uploadFile(){
+// ── Upload to SD (and optionally flash straight into a slot) ───────────────
+// FEATURE: pass 'a' or 'b' to upload AND flash in one step — works from any
+// connected device (phone, laptop, whatever's on the AP/network), not just
+// the one that originally wrote the SD card. Call with no argument for the
+// old "SD card only" behavior.
+function resetUploadButtons(){
+  btnUpload.disabled = false;
+  btnUploadFlashA.disabled = false;
+  btnUploadFlashB.disabled = false;
+}
+
+function uploadFile(slot){
   var file = fi._file;
   if(!file){ alert('Select a .bin file first.'); return; }
   var pw = document.getElementById('progWrap');
@@ -794,10 +819,12 @@ function uploadFile(){
   var pt = document.getElementById('progTxt');
   pw.style.display = 'block';
   btnUpload.disabled = true;
+  btnUploadFlashA.disabled = true;
+  btnUploadFlashB.disabled = true;
   var fd = new FormData();
   fd.append('file', file, file.name);
   var xhr = new XMLHttpRequest();
-  xhr.open('POST', '/upload');
+  xhr.open('POST', '/upload' + (slot ? ('?slot=' + slot) : ''));
   // FIX-1: do NOT set an explicit Authorization header here. The browser
   // already prompted for and cached Basic-Auth credentials when this page
   // loaded (GET / requires auth) and auto-attaches them to same-origin
@@ -811,24 +838,31 @@ function uploadFile(){
     pt.textContent = pct + '% — ' + (e.loaded/1024).toFixed(1)+' / '+(e.total/1024).toFixed(1)+' KB';
   };
   xhr.onload = function(){
-    if(xhr.status === 200){
+    if(xhr.status === 200 && slot){
+      pt.textContent = '✔ Uploaded — flashing into Slot ' + slot.toUpperCase() + '...';
+      watchFlashProgress(slot, 'Writing to flash. Do not power off.');
+    } else if(xhr.status === 200){
       pt.textContent = '✔ Upload complete! Refreshing...';
       setTimeout(function(){ location.reload(); }, 1200);
     } else if(xhr.status === 401){
       pt.textContent = '✖ Auth failed.';
-      btnUpload.disabled = false;
+      resetUploadButtons();
+    } else if(xhr.status === 202){
+      pt.textContent = '⚠ ' + xhr.responseText;
+      resetUploadButtons();
     } else {
       pt.textContent = '✖ Upload failed: ' + xhr.responseText;
-      btnUpload.disabled = false;
+      resetUploadButtons();
     }
   };
-  xhr.onerror = function(){ pt.textContent = '✖ Network error.'; btnUpload.disabled = false; };
+  xhr.onerror = function(){ pt.textContent = '✖ Network error.'; resetUploadButtons(); };
   xhr.send(fd);
 }
 
-// ── Flash SD binary to slot ───────────────────────────────────────────────
-function flashToSlot(filename, slot){
-  if(!confirm('Flash "' + filename + '" to Slot ' + slot.toUpperCase() + '?\n\nThis will overwrite the current binary in that slot.')) return;
+// ── Shared flash-progress modal + poller ────────────────────────────────────
+// Used by both flashToSlot() (SD → slot) and uploadFile(slot) (upload → SD →
+// slot in one step) so the two flows don't duplicate this logic.
+function watchFlashProgress(slot, subText){
   var modal = document.getElementById('flashModal');
   var title = document.getElementById('modalTitle');
   var sub   = document.getElementById('modalSub');
@@ -836,11 +870,10 @@ function flashToSlot(filename, slot){
   var pct   = document.getElementById('modalPct');
   modal.classList.add('show');
   title.textContent = 'Flashing to Slot ' + slot.toUpperCase() + '...';
-  sub.textContent   = 'Reading from SD, writing to flash. Do not power off.';
+  sub.textContent   = subText || 'Writing to flash. Do not power off.';
   fill.style.width  = '0%';
   pct.textContent   = '0%';
 
-  // Poll progress via SSE-style polling
   var pollInterval = setInterval(function(){
     fetch('/flash-progress')
       .then(function(r){ return r.json(); })
@@ -857,13 +890,18 @@ function flashToSlot(filename, slot){
             pct.textContent   = '100%';
           } else {
             title.textContent = '✖ Flash Failed';
-            sub.textContent   = d.error || 'Unknown error. SD binary may be corrupt.';
-            setTimeout(function(){ modal.classList.remove('show'); }, 4000);
+            sub.textContent   = d.error || 'Unknown error. Binary may be corrupt.';
+            setTimeout(function(){ modal.classList.remove('show'); resetUploadButtons(); }, 4000);
           }
         }
       }).catch(function(){ /* ignore poll errors during reboot */ });
   }, 400);
+}
 
+// ── Flash SD binary to slot ───────────────────────────────────────────────
+function flashToSlot(filename, slot){
+  if(!confirm('Flash "' + filename + '" to Slot ' + slot.toUpperCase() + '?\n\nThis will overwrite the current binary in that slot.')) return;
+  watchFlashProgress(slot, 'Reading from SD, writing to flash. Do not power off.');
   fetch('/flash?file=' + encodeURIComponent(filename) + '&slot=' + slot, {method:'POST'})
     .catch(function(){ /* Device rebooted, connection closed — expected */ });
 }
@@ -1456,6 +1494,7 @@ static bool   g_uploadOk = false;
 static bool   g_uploadAuthed = false;
 static bool   g_uploadIOLocked = false;
 static String g_uploadPath;
+static String g_uploadFilename;   // bare filename, for the optional direct-flash step below
 
 void handleUploadBody() {
   HTTPUpload& up = server.upload();
@@ -1499,6 +1538,7 @@ void handleUploadBody() {
       g_uploadIOLocked = false;
       return;
     }
+    g_uploadFilename = fname;
     Serial.println("[UPLOAD] Start → " + g_uploadPath);
     g_uploadOk = true;
   }
@@ -1538,9 +1578,47 @@ void handleUploadDone() {
   if (!g_uploadAuthed) return;  // checkAuth()/checkOrigin() already sent the error response
   if (!g_uploadOk) {
     server.send(400, "text/plain", "Upload failed or rejected (invalid file / SD error)");
-  } else {
-    server.send(200, "text/plain", "Upload successful");
+    return;
   }
+
+  // FEATURE: one-step "upload from phone → flash directly into a slot".
+  // Client requests this by adding ?slot=a|b to the /upload URL. Internally
+  // it's still "save to SD, then flash from SD" (same trusted path as the
+  // manual two-click flow) — this just chains the two steps automatically
+  // so any connected device can push straight into a slot without a
+  // separate /flash click. Falls back to a plain "saved to SD" response if
+  // no slot was requested, or reports the conflict/OOM cases the same way
+  // handleFlash() does if a flash/erase is already running.
+  if (server.hasArg("slot")) {
+    String slot = server.arg("slot");
+    slot.toLowerCase();
+    if (slot == "a" || slot == "b") {
+      if (flashInProgress || eraseInProgress) {
+        server.send(202, "text/plain",
+                    "Saved to SD, but a flash/erase is already in progress — "
+                    "flash it manually from the dashboard once free.");
+        return;
+      }
+      FlashTaskCtx* ctx = new FlashTaskCtx();
+      strncpy(ctx->fname, g_uploadFilename.c_str(), sizeof(ctx->fname) - 1);
+      ctx->fname[sizeof(ctx->fname) - 1] = '\0';
+      ctx->slot = slot.charAt(0);
+
+      fpSet(0, false, false, "");
+      flashInProgress = true;
+      BaseType_t ok = xTaskCreate(flashTask, "flashTask", 8192, ctx, 1, NULL);
+      if (ok != pdPASS) {
+        flashInProgress = false;
+        delete ctx;
+        server.send(500, "text/plain", "Saved to SD, but could not start flash task (low memory)");
+        return;
+      }
+      server.send(200, "text/plain", "Uploaded — flashing into slot " + slot + " now");
+      return;
+    }
+  }
+
+  server.send(200, "text/plain", "Upload successful");
 }
 
 // ── POST /delete?file=xxx.bin ─────────────────────────────────────────────
@@ -1612,7 +1690,22 @@ void handleStatus() {
 // on the next restart.
 
 // ── 404 handler ───────────────────────────────────────────────────────────
+// Captive-portal behavior (FEATURE: auto-open on AP connect): phones/laptops
+// probe well-known URLs (e.g. Android's /generate_204, iOS's
+// /hotspot-detect.html, Windows's /ncsi.txt) right after joining a WiFi AP.
+// None of those match a route we've registered, so they all land here via
+// server.onNotFound(). In AP mode, redirecting ANY unmatched request to "/"
+// makes those probes fail their expected "internet reachable" check, which
+// is exactly what makes the OS pop its "Sign in to network" captive-portal
+// browser automatically — landing the user straight on the dashboard.
+// In STA mode (connected to the home WiFi) this stays a plain 404; there's
+// no captive-portal flow to trigger on a normal network.
 void handleNotFound() {
+  if (apMode) {
+    server.sendHeader("Location", "http://" + WiFi.softAPIP().toString() + "/", true);
+    server.send(302, "text/plain", "");
+    return;
+  }
   server.send(404, "text/plain", "Not found: " + server.uri());
 }
 
@@ -1749,6 +1842,12 @@ void setup() {
     Serial.println("\n[WiFi] STA failed → AP mode");
     Serial.println("[AP]   SSID: " + String(AP_SSID) + "  Pass: " + String(AP_PASS));
     Serial.println("[AP]   IP:   " + WiFi.softAPIP().toString());
+
+    // FEATURE: captive portal — answer every DNS query on the AP with our
+    // own IP, so any hostname a connecting phone tries to resolve (used by
+    // its captive-portal probe) points straight back at us.
+    dnsServer.start(DNS_PORT, "*", WiFi.softAPIP());
+    Serial.println("[DNS] Captive portal DNS started — connect to AP and the dashboard should open automatically");
   }
 
   // ── Register routes ───────────────────────────────────────────────────────
@@ -1773,6 +1872,7 @@ void setup() {
 //   LOOP
 // ═══════════════════════════════════════════════════════════════════════════
 void loop() {
+  if (apMode) dnsServer.processNextRequest();  // Captive portal DNS
   server.handleClient();
   delay(2);
 }
