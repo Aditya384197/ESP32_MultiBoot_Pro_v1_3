@@ -1,0 +1,79 @@
+name: Build ESP32 MultiBoot Manager
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - '**.ino'
+      - '**.h'
+      - '**.cpp'
+      - 'partitions.csv'
+      - '.github/workflows/build.yml'
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  compile-manager:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Install arduino-cli
+        uses: arduino/setup-arduino-cli@v2
+
+      - name: Install ESP32 core
+        run: |
+          arduino-cli core update-index --additional-urls https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
+          arduino-cli core install esp32:esp32 --additional-urls https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
+
+      # Sketch folder name MUST match the .ino filename (Arduino rule).
+      # Adjust SKETCH_DIR below to wherever ESP32_MultiBoot_Pro_v1_3.ino
+      # actually lives in your repo.
+      - name: Compile MultiBoot Manager
+        env:
+          SKETCH_DIR: ESP32_MultiBoot_Pro_v1_3
+        run: |
+          mkdir -p "$SKETCH_DIR"
+          # If your repo already has this folder committed, remove the
+          # copy step below and just let checkout provide it.
+          [ -f "$SKETCH_DIR/$SKETCH_DIR.ino" ] || cp ESP32_MultiBoot_Pro_v1_3.ino "$SKETCH_DIR/$SKETCH_DIR.ino"
+          [ -f "$SKETCH_DIR/partitions.csv" ] || cp partitions.csv "$SKETCH_DIR/partitions.csv"
+          arduino-cli compile \
+            --fqbn "esp32:esp32:esp32:PartitionScheme=huge_app" \
+            --warnings all \
+            "$SKETCH_DIR"
+
+  compile-header-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Install arduino-cli
+        uses: arduino/setup-arduino-cli@v2
+
+      - name: Install ESP32 core
+        run: |
+          arduino-cli core update-index --additional-urls https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
+          arduino-cli core install esp32:esp32 --additional-urls https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
+
+      # Standalone sanity build: proves ReturnToManager.h compiles cleanly
+      # on its own, the way any slot_a/slot_b app would include it.
+      - name: Build stub sketch including ReturnToManager.h
+        run: |
+          mkdir -p RTM_HeaderCheck
+          cp ReturnToManager.h RTM_HeaderCheck/ReturnToManager.h
+          cat > RTM_HeaderCheck/RTM_HeaderCheck.ino << 'EOF'
+          #include "ReturnToManager.h"
+          void setup() {
+            Serial.begin(115200);
+            rtm_bootSafetyCheck();
+            rtm_markBootOK();
+          }
+          void loop() {}
+          EOF
+          arduino-cli compile \
+            --fqbn "esp32:esp32:esp32:PartitionScheme=huge_app" \
+            --warnings all \
+            RTM_HeaderCheck
