@@ -15,6 +15,12 @@ on:
 jobs:
   compile-manager:
     runs-on: ubuntu-latest
+    env:
+      # Sketch folder name MUST match the .ino filename (Arduino rule).
+      # Adjust below to wherever ESP32_MultiBoot_Pro_v1_3.ino actually
+      # lives in your repo. Set at job level so every step in this job
+      # (compile AND merge) can see it.
+      SKETCH_DIR: ESP32_MultiBoot_Pro_v1_3
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -27,12 +33,7 @@ jobs:
           arduino-cli core update-index --additional-urls https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
           arduino-cli core install esp32:esp32 --additional-urls https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
 
-      # Sketch folder name MUST match the .ino filename (Arduino rule).
-      # Adjust SKETCH_DIR below to wherever ESP32_MultiBoot_Pro_v1_3.ino
-      # actually lives in your repo.
       - name: Compile MultiBoot Manager
-        env:
-          SKETCH_DIR: ESP32_MultiBoot_Pro_v1_3
         run: |
           mkdir -p "$SKETCH_DIR"
           # If your repo already has this folder committed, remove the
@@ -52,10 +53,11 @@ jobs:
           BIN="build-output/${SKETCH_DIR}.ino.bin"
           BOOT="build-output/${SKETCH_DIR}.ino.bootloader.bin"
           PART="build-output/${SKETCH_DIR}.ino.partitions.bin"
+          ls -la build-output/
           echo "App bin size: $(stat -c%s "$BIN") bytes"
-          python3 -m esptool --chip esp32 merge_bin \
+          python3 -m esptool --chip esp32 merge-bin \
             -o "build-output/merged-firmware.bin" \
-            --flash_mode dio --flash_freq 40m --flash_size 4MB \
+            --flash-mode dio --flash-freq 40m --flash-size 4MB \
             0x1000  "$BOOT" \
             0x8000  "$PART" \
             0x10000 "$BIN"
