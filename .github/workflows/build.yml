@@ -46,6 +46,21 @@ jobs:
             --output-dir build-output \
             "$SKETCH_DIR"
 
+      - name: Merge into a single flashable image
+        run: |
+          pip install --quiet esptool
+          BIN="build-output/${SKETCH_DIR}.ino.bin"
+          BOOT="build-output/${SKETCH_DIR}.ino.bootloader.bin"
+          PART="build-output/${SKETCH_DIR}.ino.partitions.bin"
+          echo "App bin size: $(stat -c%s "$BIN") bytes"
+          python3 -m esptool --chip esp32 merge_bin \
+            -o "build-output/merged-firmware.bin" \
+            --flash_mode dio --flash_freq 40m --flash_size 4MB \
+            0x1000  "$BOOT" \
+            0x8000  "$PART" \
+            0x10000 "$BIN"
+          echo "Merged image size: $(stat -c%s build-output/merged-firmware.bin) bytes"
+
       - name: Upload compiled binaries
         uses: actions/upload-artifact@v4
         with:
