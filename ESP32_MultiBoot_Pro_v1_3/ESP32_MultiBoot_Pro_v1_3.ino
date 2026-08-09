@@ -257,6 +257,32 @@
 #endif
 
 // ═══════════════════════════════════════════════════════════════════════════
+//   FORWARD TYPE DEFINITIONS
+//   NOTE: Arduino's ctags-based prototype generator hoists a forward
+//   declaration for every function to a point immediately after this
+//   include block — BEFORE any of our own code further down. Any function
+//   whose signature (param or return type) uses a custom struct/enum will
+//   fail to compile with "'X' does not name a type" unless that type is
+//   already defined up here, ahead of the hoisted prototypes. Keep these
+//   three type definitions here — do NOT move them back down next to their
+//   usage sites.
+// ═══════════════════════════════════════════════════════════════════════════
+struct LoginAttempt {
+  uint32_t ip        = 0;
+  uint8_t  fails     = 0;
+  uint32_t lockUntil = 0;   // millis() timestamp, 0 = not locked
+};
+
+enum SlotStatus { SLOT_EMPTY, SLOT_VALID };
+
+struct FlashProgress {
+  uint8_t  pct    = 0;
+  bool     done   = false;
+  bool     ok     = false;
+  char     error[80] = {0};
+};
+
+// ═══════════════════════════════════════════════════════════════════════════
 //   CONFIG — Edit these
 // ═══════════════════════════════════════════════════════════════════════════
 const char* WIFI_SSID       = "YOUR_WIFI_SSID";
@@ -280,7 +306,12 @@ const char* AP_PASS         = "bootmgr-ap-2026";
 #define SD_MOSI  23
 #define SD_MISO  19
 #define SD_SCK   18
+// Newer esp32-hal.h in the Arduino core already #defines BOOT_PIN (to the
+// same GPIO 0) — guard so we don't trigger a harmless-but-noisy redefinition
+// warning on cores that provide it.
+#ifndef BOOT_PIN
 #define BOOT_PIN 0   // Hold LOW at power-on to force manager mode
+#endif
 
 // ═══════════════════════════════════════════════════════════════════════════
 //   CONSTANTS
@@ -332,14 +363,12 @@ volatile bool flashInProgress = false;
 volatile bool eraseInProgress = false;
 
 // ─── FIX-8: lightweight per-IP brute-force lockout for Basic Auth ─────────
+// (struct LoginAttempt is defined near the top of the file — see the
+// "FORWARD TYPE DEFINITIONS" block — so it's already known before Arduino's
+// hoisted function prototypes need it.)
 #define LOGIN_TRACK_SLOTS   8
 #define LOGIN_MAX_FAILS     5
 #define LOGIN_LOCK_MS       30000UL
-struct LoginAttempt {
-  uint32_t ip        = 0;
-  uint8_t  fails     = 0;
-  uint32_t lockUntil = 0;   // millis() timestamp, 0 = not locked
-};
 LoginAttempt loginTrack[LOGIN_TRACK_SLOTS];
 
 // FIX-19: recycle a genuinely idle slot (never used, or used-but-clean)
@@ -376,8 +405,8 @@ LoginAttempt* findLoginSlot(uint32_t ip) {
 // app has booted and taken over — at which point this manager code, and this
 // function, are not executing at all. Keeping SLOT_ACTIVE around implied the
 // manager could see its own slots running, which it structurally cannot.
-enum SlotStatus { SLOT_EMPTY, SLOT_VALID };
-
+// (enum SlotStatus itself is defined near the top of the file — see the
+// "FORWARD TYPE DEFINITIONS" block.)
 SlotStatus getSlotStatus(const char* partName) {
   const esp_partition_t* part = esp_partition_find_first(
       ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_ANY, partName);
@@ -885,13 +914,10 @@ function deleteFile(name){
 
 // ═══════════════════════════════════════════════════════════════════════════
 //   FLASH PROGRESS (for polling during SD→slot flash)
+//   (struct FlashProgress itself is defined near the top of the file — see
+//   the "FORWARD TYPE DEFINITIONS" block.)
 // ═══════════════════════════════════════════════════════════════════════════
-struct FlashProgress {
-  uint8_t  pct    = 0;
-  bool     done   = false;
-  bool     ok     = false;
-  char     error[80] = {0};
-} fp;
+FlashProgress fp;
 
 // FIX-12: fp used to be read by handleFlashProgress() (loop()/server task)
 // while being written field-by-field by flashTask() (a separate FreeRTOS
@@ -1366,7 +1392,7 @@ void eraseTask(void* param) {
     // so `part` (slot_a/slot_b) can never be the running partition in the
     // first place. See getSlotStatus() comment for the full reasoning.
     Serial.printf("[ERASE] Erasing %s (0x%X, %u bytes)\n",
-                  partName, part->address, part->size);
+                  partName, (unsigned)part->address, (unsigned)part->size);
     esp_err_t err = esp_partition_erase_range(part, 0, part->size);
     if (err != ESP_OK) {
       Serial.printf("[ERASE] ERROR: erase failed: 0x%X\n", err);
