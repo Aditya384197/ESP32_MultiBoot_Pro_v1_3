@@ -1,22 +1,32 @@
 /*
  * ╔══════════════════════════════════════════════════════════════════════════╗
  * ║   ESP32 MULTIBOOT MANAGER — PRO                                        ║
- * ║   Dual-Slot Persistent Boot Manager with SD Card Binary Library        ║
+ * ║   Dual-Slot Persistent Boot Manager — Direct WiFi Upload (No SD Card)  ║
  * ╠══════════════════════════════════════════════════════════════════════════╣
  * ║  CONCEPT                                                                ║
  * ║  This firmware lives in the FACTORY partition and is NEVER erased by   ║
  * ║  OTA operations. It manages two persistent OTA slots (A and B) which   ║
- * ║  can each hold a different application binary (~1.2MB each). Binaries  ║
- * ║  are stored on SD card and flashed into slots on demand. Once a slot   ║
- * ║  is flashed, booting from it takes only 2-3 seconds — no SD read      ║
- * ║  needed. The manager itself always boots first; it checks a boot-flag  ║
- * ║  in NVS and either stays as manager or chains to the selected slot.    ║
+ * ║  can each hold a different application binary (~1.2MB each). A .bin    ║
+ * ║  file is uploaded straight from a connected phone/PC over WiFi (AP or  ║
+ * ║  home network) and streamed directly into the target slot's flash     ║
+ * ║  partition as it arrives — no SD card, no intermediate storage. Once   ║
+ * ║  a slot is flashed, booting from it takes only 2-3 seconds. The       ║
+ * ║  manager itself always boots first; it checks a boot-flag in NVS and   ║
+ * ║  either stays as manager or chains to the selected slot.               ║
+ * ╠══════════════════════════════════════════════════════════════════════════╣
+ * ║  V1.4 CHANGE: SD card module removed entirely. Earlier versions of     ║
+ * ║  this file stored uploaded binaries on an SD card and flashed them     ║
+ * ║  into a slot as a second step; that whole subsystem (SD.h/SPI.h,       ║
+ * ║  BINARIES_DIR listing, /flash, /delete) is gone. Upload now writes     ║
+ * ║  directly into the target esp_ota partition via esp_ota_begin/write/   ║
+ * ║  end as each HTTP chunk arrives — the same trusted, well-tested API    ║
+ * ║  this manager already used for the SD→slot write, just fed from the   ║
+ * ║  live upload stream instead of a file. Historical FIX-N comments below ║
+ * ║  describing the old SD-based flow are kept as-is for project history;  ║
+ * ║  they describe behavior that no longer exists in this version.         ║
  * ╠══════════════════════════════════════════════════════════════════════════╣
  * ║  HARDWARE                                                               ║
  * ║  • ESP32 (4MB Flash minimum)                                           ║
- * ║  • SD Card Module (SPI):                                               ║
- * ║      SD_MOSI → GPIO 23  |  SD_MISO → GPIO 19                         ║
- * ║      SD_SCK  → GPIO 18  |  SD_CS   → GPIO 5                          ║
  * ║  • (Optional) Button on GPIO 0 → GND = force manager mode at boot     ║
  * ╠══════════════════════════════════════════════════════════════════════════╣
  * ║  ARDUINO IDE / ARDUINODROID SETUP                                      ║
@@ -238,8 +248,6 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <DNSServer.h>
-#include <SD.h>
-#include <SPI.h>
 #include <Update.h>
 #include <Preferences.h>
 #include <esp_ota_ops.h>
@@ -268,7 +276,7 @@
 //   whose signature (param or return type) uses a custom struct/enum will
 //   fail to compile with "'X' does not name a type" unless that type is
 //   already defined up here, ahead of the hoisted prototypes. Keep these
-//   three type definitions here — do NOT move them back down next to their
+//   type definitions here — do NOT move them back down next to their
 //   usage sites.
 // ═══════════════════════════════════════════════════════════════════════════
 struct LoginAttempt {
@@ -278,13 +286,6 @@ struct LoginAttempt {
 };
 
 enum SlotStatus { SLOT_EMPTY, SLOT_VALID };
-
-struct FlashProgress {
-  uint8_t  pct    = 0;
-  bool     done   = false;
-  bool     ok     = false;
-  char     error[80] = {0};
-};
 
 // ═══════════════════════════════════════════════════════════════════════════
 //   CONFIG — Edit these
@@ -306,10 +307,6 @@ const char* AP_PASS         = "bootmgr-ap-2026";
 // ═══════════════════════════════════════════════════════════════════════════
 //   PIN DEFINITIONS
 // ═══════════════════════════════════════════════════════════════════════════
-#define SD_CS    5
-#define SD_MOSI  23
-#define SD_MISO  19
-#define SD_SCK   18
 // Newer esp32-hal.h in the Arduino core already #defines BOOT_PIN (to the
 // same GPIO 0) — guard so we don't trigger a harmless-but-noisy redefinition
 // warning on cores that provide it.
@@ -328,10 +325,9 @@ const char* AP_PASS         = "bootmgr-ap-2026";
 // the "mbmgr" namespace — manager resets it to 0 on any manually-requested
 // boot so the slot app gets a fresh unconfirmed-boot budget.
 #define PREF_BOOT_FAILS  "boot_fails"
-#define BINARIES_DIR     "/binaries"
 #define OTA_MAGIC_BYTE   0xE9        // Valid ESP32 image first byte
-#define FLASH_BUF_SIZE   4096        // Read buffer for SD→Flash streaming
 #define DNS_PORT         53          // Captive-portal DNS (AP mode only)
+#define MIN_FW_SIZE      65536       // Reject anything smaller as "not real firmware"
 
 // Boot targets stored in NVS
 #define TARGET_MANAGER "manager"
@@ -344,14 +340,13 @@ const char* AP_PASS         = "bootmgr-ap-2026";
 WebServer   server(80);
 DNSServer   dnsServer;   // Captive portal: only started/serviced in AP mode
 Preferences prefs;
-bool        sdReady        = false;
 bool        apMode         = false;
 String      slotAName      = "";   // Name of binary currently in slot A
 String      slotBName      = "";   // Name of binary currently in slot B
 
-// ─── FIX-4: shared mutex — guards every SD.* and prefs.* access so the ─────
-// async flash task (see below) and the synchronous WebServer handlers in
-// loop() never touch the SD card / NVS at the same instant.
+// ─── FIX-4: shared mutex — guards every prefs.* access so the upload/flash ─
+// handler and the synchronous WebServer handlers in loop() never touch NVS
+// at the same instant.
 SemaphoreHandle_t ioMutex = NULL;
 bool lockIO(uint32_t timeoutMs = 3000) {
   if (!ioMutex) return true;  // not yet created (very early boot) — no contention possible
@@ -361,8 +356,8 @@ void unlockIO() {
   if (ioMutex) xSemaphoreGive(ioMutex);
 }
 
-// ─── FIX-2/FIX-4: guards against a second /flash request while one is ─────
-// already streaming SD → OTA partition in the background task.
+// ─── FIX-2/FIX-4: guards against a second upload/flash request while one ──
+// is already streaming into an OTA partition.
 volatile bool flashInProgress = false;
 
 // ─── FIX-16: same pattern as flashInProgress, for the now-async erase task ─
@@ -548,8 +543,8 @@ String sanitizeFilename(String fname) {
 //   WEB UI HTML — Futuristic Dark Theme
 // ═══════════════════════════════════════════════════════════════════════════
 // Served from C string to avoid SPIFFS dependency for the UI itself.
-// Uses template placeholders: __SLOT_A__, __SLOT_B__, __BIN_LIST__,
-// __IP__, __WIFI_MODE__, __SD_STATUS__
+// Uses template placeholders: __SLOT_A_NAME__, __SLOT_B_NAME__,
+// __IP__, __WIFI_MODE__ (see the page.replace() calls in buildPage())
 
 static const char HTML_PAGE[] PROGMEM = R"HTMLEOF(<!DOCTYPE html>
 <html lang="en">
@@ -559,124 +554,95 @@ static const char HTML_PAGE[] PROGMEM = R"HTMLEOF(<!DOCTYPE html>
 <title>ESP32 MultiBoot Manager</title>
 <style>
 :root{
-  --bg:#0a0e17;--bg2:#0f1420;--bg3:#141a28;
-  --c1:#00e5ff;--c2:#00ff9d;--c3:#ff6b35;--c4:#ffd93d;--c5:#ff3366;
-  --bdr:rgba(0,229,255,.18);--bdr2:rgba(0,255,157,.18);
-  --txt:#d0e8ff;--dim:#4a6080;--dim2:#1a2540;
-  --sh1:0 0 20px rgba(0,229,255,.3);
-  --sh2:0 0 20px rgba(0,255,157,.3);
+  --bg:#0a0a0a;--bg2:#131313;--bg3:#1b1b1b;
+  --line:#2c2c2c;--line2:#3a3a3a;
+  --txt:#ededed;--dim:#8a8a8a;--dim2:#525252;
+  --w:#ffffff;--k:#000000;
 }
 *{box-sizing:border-box;margin:0;padding:0}
-html,body{background:var(--bg);color:var(--txt);font-family:'Segoe UI',system-ui,sans-serif;min-height:100vh}
+html,body{background:var(--bg);color:var(--txt);font-family:-apple-system,'Segoe UI',system-ui,sans-serif;min-height:100vh}
 body{padding:20px 12px 40px}
-h1{font-size:1.5rem;font-weight:900;letter-spacing:3px;text-transform:uppercase;
-   background:linear-gradient(90deg,var(--c1),var(--c2));-webkit-background-clip:text;
-   -webkit-text-fill-color:transparent;margin-bottom:4px}
-.sub{color:var(--dim);font-size:.8rem;letter-spacing:1px;margin-bottom:20px}
+h1{font-size:1.3rem;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:var(--w);margin-bottom:4px}
+.sub{color:var(--dim);font-size:.78rem;letter-spacing:.5px;margin-bottom:20px}
 .wrap{max-width:720px;margin:0 auto}
 /* Status bar */
 .sbar{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:18px;
-      background:var(--bg2);border:1px solid var(--bdr);border-radius:8px;padding:10px 14px}
-.sitem{font-size:.75rem;color:var(--dim);letter-spacing:.5px}
+      background:var(--bg2);border:1px solid var(--line);border-radius:8px;padding:10px 14px}
+.sitem{font-size:.75rem;color:var(--dim);letter-spacing:.3px}
 .sitem span{color:var(--txt);font-weight:600;margin-left:4px}
-.sitem .on{color:var(--c2)}.sitem .off{color:var(--c5)}.sitem .warn{color:var(--c4)}
+.sitem .on{color:var(--w)}.sitem .off{color:var(--dim)}.sitem .warn{color:var(--txt)}
 /* Cards */
-.card{background:var(--bg2);border:1px solid var(--bdr);border-radius:10px;
-      padding:18px;margin-bottom:16px;position:relative;overflow:hidden}
-.card::before{content:"";position:absolute;top:0;left:0;right:0;height:2px;
-              background:linear-gradient(90deg,var(--c1),transparent)}
-.card-b::before{background:linear-gradient(90deg,var(--c2),transparent)}
-.card-c::before{background:linear-gradient(90deg,var(--c4),transparent)}
+.card{background:var(--bg2);border:1px solid var(--line);border-radius:10px;
+      padding:18px;margin-bottom:16px}
 .card-title{font-size:.7rem;font-weight:700;letter-spacing:2px;text-transform:uppercase;
-            color:var(--c1);margin-bottom:14px;display:flex;align-items:center;gap:8px}
-.card-b .card-title{color:var(--c2)}
-.card-c .card-title{color:var(--c4)}
+            color:var(--dim);margin-bottom:14px;display:flex;align-items:center;gap:8px}
 /* Slot cards */
 .slots{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:16px}
 @media(max-width:540px){.slots{grid-template-columns:1fr}}
-.slot{background:var(--bg3);border:1px solid var(--bdr);border-radius:8px;padding:14px;
-      position:relative;transition:border-color .2s}
-.slot.valid{border-color:var(--bdr)}
-.slot.empty{border-color:var(--dim2);opacity:.7}
-.slot-id{font-size:.6rem;letter-spacing:3px;text-transform:uppercase;color:var(--dim);margin-bottom:6px}
-.slot-name{font-size:.9rem;font-weight:700;color:var(--txt);font-family:monospace;
+.slot{background:var(--bg3);border:1px solid var(--line);border-radius:8px;padding:14px;
+      transition:border-color .15s ease-out}
+.slot.valid{border-color:var(--line2)}
+.slot.empty{border-color:var(--line);opacity:.65}
+.slot-id{font-size:.6rem;letter-spacing:2px;text-transform:uppercase;color:var(--dim);margin-bottom:6px}
+.slot-name{font-size:.9rem;font-weight:600;color:var(--txt);font-family:ui-monospace,monospace;
            word-break:break-all;margin-bottom:8px;min-height:20px}
 .slot-tag{display:inline-block;font-size:.6rem;font-weight:700;letter-spacing:1px;
-          padding:2px 8px;border-radius:20px;text-transform:uppercase}
-.tag-valid{background:var(--bdr2);color:var(--c2);border:1px solid var(--c2)}
-.tag-empty{background:var(--dim2);color:var(--dim)}
+          padding:2px 8px;border-radius:20px;text-transform:uppercase;border:1px solid var(--line2)}
+.tag-valid{background:var(--w);color:var(--k);border-color:var(--w)}
+.tag-empty{background:transparent;color:var(--dim)}
 .slot-btns{display:flex;gap:6px;margin-top:10px;flex-wrap:wrap}
-/* Buttons */
-.btn{border:none;border-radius:6px;padding:7px 13px;font-size:.75rem;font-weight:700;
-     cursor:pointer;letter-spacing:.5px;transition:all .15s;text-transform:uppercase}
-.btn:hover{opacity:.85;transform:translateY(-1px)}
-.btn:active{transform:scale(.97)}
-.btn:disabled{opacity:.3;cursor:not-allowed;transform:none}
-.btn-primary{background:var(--c1);color:#000}
-.btn-success{background:var(--c2);color:#000}
-.btn-warn{background:var(--c4);color:#000}
-.btn-danger{background:transparent;border:1px solid var(--c5);color:var(--c5)}
-.btn-ghost{background:transparent;border:1px solid var(--bdr);color:var(--txt)}
-.btn-lg{width:100%;padding:11px;font-size:.85rem;margin-top:12px}
-/* Binary list */
-.binlist{display:flex;flex-direction:column;gap:8px}
-.binitem{display:flex;align-items:center;justify-content:space-between;
-         padding:12px 14px;background:var(--bg3);border:1px solid var(--bdr);
-         border-radius:8px;transition:border-color .2s;gap:10px}
-.binitem:hover{border-color:var(--c1)}
-.bin-info{flex:1;min-width:0}
-.bin-name{font-family:monospace;font-size:.9rem;color:var(--txt);word-break:break-all}
-.bin-meta{font-size:.72rem;color:var(--dim);margin-top:2px}
-.bin-btns{display:flex;gap:6px;flex-shrink:0;flex-wrap:wrap}
-.empty-msg{text-align:center;color:var(--dim);padding:20px;font-size:.85rem;
-           border:1px dashed var(--bdr);border-radius:8px}
+/* Buttons — flat grayscale, no glow/gradient, cheap to render every frame */
+.btn{border:1px solid var(--line2);border-radius:6px;padding:7px 13px;font-size:.75rem;font-weight:600;
+     cursor:pointer;letter-spacing:.3px;transition:background-color .12s ease-out;text-transform:uppercase;
+     background:var(--bg3);color:var(--txt)}
+.btn:hover{background:var(--line)}
+.btn:active{background:var(--line2)}
+.btn:disabled{opacity:.35;cursor:not-allowed}
+.btn-primary{background:var(--w);color:var(--k);border-color:var(--w)}
+.btn-primary:hover{background:#d8d8d8}
+.btn-danger{background:transparent;border:1px solid var(--dim2);color:var(--dim)}
+.btn-danger:hover{border-color:var(--w);color:var(--w)}
+.btn-lg{width:100%;padding:11px;font-size:.85rem}
 /* Upload zone */
-.dropzone{border:2px dashed var(--bdr);border-radius:8px;padding:28px 20px;
-          text-align:center;cursor:pointer;transition:all .2s;margin-bottom:12px}
-.dropzone:hover,.dropzone.drag{border-color:var(--c1);background:rgba(0,229,255,.04)}
+.dropzone{border:1px dashed var(--line2);border-radius:8px;padding:28px 20px;
+          text-align:center;cursor:pointer;transition:border-color .15s ease-out;margin-bottom:12px}
+.dropzone:hover,.dropzone.drag{border-color:var(--w);border-style:solid}
 .dropzone input{display:none}
-.dz-icon{font-size:2rem;margin-bottom:8px;opacity:.6}
-.dz-label{color:var(--c1);font-weight:600;cursor:pointer;font-size:.85rem}
+.dz-icon{font-size:1.6rem;margin-bottom:8px;color:var(--dim)}
+.dz-label{color:var(--w);font-weight:600;cursor:pointer;font-size:.85rem;text-decoration:underline}
 .dz-sub{color:var(--dim);font-size:.75rem;margin-top:6px}
-.dz-fname{margin-top:8px;font-family:monospace;font-size:.8rem;
-          color:var(--c2);display:none}
-/* Progress */
+.dz-fname{margin-top:8px;font-family:ui-monospace,monospace;font-size:.8rem;
+          color:var(--txt);display:none}
+/* Progress — flat fill, no gradient/animation cost */
 .prog-wrap{display:none;margin-top:10px}
 .prog-track{height:6px;background:var(--bg3);border-radius:3px;overflow:hidden;
-            border:1px solid var(--bdr)}
-.prog-fill{height:100%;width:0%;background:linear-gradient(90deg,var(--c1),var(--c2));
-           border-radius:3px;transition:width .2s}
+            border:1px solid var(--line)}
+.prog-fill{height:100%;width:0%;background:var(--w);border-radius:3px;transition:width .15s linear}
 .prog-txt{font-size:.72rem;color:var(--dim);margin-top:5px;text-align:center}
-/* Flash modal */
-.modal{display:none;position:fixed;inset:0;background:rgba(10,14,23,.95);z-index:999;
+/* Boot/erase modal */
+.modal{display:none;position:fixed;inset:0;background:rgba(0,0,0,.92);z-index:999;
        flex-direction:column;align-items:center;justify-content:center;gap:16px}
 .modal.show{display:flex}
-.spinner{width:44px;height:44px;border:3px solid var(--bdr);border-top-color:var(--c1);
+.spinner{width:36px;height:36px;border:3px solid var(--line2);border-top-color:var(--w);
          border-radius:50%;animation:spin .7s linear infinite}
 @keyframes spin{to{transform:rotate(360deg)}}
-.modal-title{font-size:1rem;font-weight:700;color:var(--txt);letter-spacing:1px}
+.modal-title{font-size:1rem;font-weight:700;color:var(--txt);letter-spacing:.5px}
 .modal-sub{font-size:.8rem;color:var(--dim);text-align:center;max-width:320px}
-.modal-prog{width:280px;height:6px;background:var(--bg3);border-radius:3px;overflow:hidden}
-.modal-prog-fill{height:100%;width:0%;background:linear-gradient(90deg,var(--c1),var(--c2));
-                 transition:width .3s;border-radius:3px}
-.modal-pct{font-size:.75rem;color:var(--c1);font-weight:700}
 /* Misc */
-.divider{border:none;border-top:1px solid var(--bdr);margin:14px 0}
 .tip{font-size:.72rem;color:var(--dim);line-height:1.6;margin-top:10px;
-     padding:8px 12px;background:var(--bg3);border-radius:6px;border-left:2px solid var(--c4)}
+     padding:8px 12px;background:var(--bg3);border-radius:6px;border-left:2px solid var(--line2)}
 </style>
 </head>
 <body>
 <div class="wrap">
 
-<h1>⚡ MultiBoot Manager</h1>
+<h1>MultiBoot Manager</h1>
 <div class="sub">ESP32 Dual-Slot Persistent Boot System</div>
 
 <!-- Status Bar -->
 <div class="sbar">
   <div class="sitem">WiFi<span id="wifiMode" class="__WIFI_CLASS__">__WIFI_MODE__</span></div>
   <div class="sitem">IP<span id="espIp">__IP__</span></div>
-  <div class="sitem">SD Card<span id="sdStat" class="__SD_CLASS__">__SD_STATUS__</span></div>
   <div class="sitem">Uptime<span id="uptime">--</span></div>
 </div>
 
@@ -696,17 +662,11 @@ h1{font-size:1.5rem;font-weight:900;letter-spacing:3px;text-transform:uppercase;
   </div>
 </div>
 
-<!-- SD Binaries -->
-<div class="card">
-  <div class="card-title">📁 SD Card — Binary Library</div>
-  <div class="binlist" id="binList">__BIN_LIST__</div>
-</div>
-
 <!-- Upload -->
-<div class="card card-b">
-  <div class="card-title">⬆ Upload Binary to SD Card</div>
+<div class="card">
+  <div class="card-title">⬆ Upload &amp; Flash Binary</div>
   <div class="dropzone" id="dropZone">
-    <div class="dz-icon">📦</div>
+    <div class="dz-icon">+</div>
     <div>Drop .bin file here or <label class="dz-label" for="fileInput">browse</label></div>
     <input type="file" id="fileInput" accept=".bin">
     <div class="dz-sub">Only valid ESP32 firmware .bin files accepted</div>
@@ -716,49 +676,40 @@ h1{font-size:1.5rem;font-weight:900;letter-spacing:3px;text-transform:uppercase;
     <div class="prog-track"><div class="prog-fill" id="progFill"></div></div>
     <div class="prog-txt" id="progTxt">Uploading...</div>
   </div>
-  <button class="btn btn-success btn-lg" id="btnUpload" onclick="uploadFile()" disabled>
-    Upload to SD Card
-  </button>
-  <div style="display:flex;gap:.6rem;margin-top:.6rem">
-    <button class="btn btn-lg" id="btnUploadFlashA" onclick="uploadFile('a')" disabled style="flex:1">
-      ⚡ Upload &amp; Flash → Slot A
+  <div style="display:flex;gap:.6rem;margin-top:12px">
+    <button class="btn btn-primary btn-lg" id="btnUploadFlashA" onclick="uploadFile('a')" disabled style="flex:1">
+      → Flash Slot A
     </button>
-    <button class="btn btn-lg" id="btnUploadFlashB" onclick="uploadFile('b')" disabled style="flex:1">
-      ⚡ Upload &amp; Flash → Slot B
+    <button class="btn btn-primary btn-lg" id="btnUploadFlashB" onclick="uploadFile('b')" disabled style="flex:1">
+      → Flash Slot B
     </button>
   </div>
   <div class="tip">
-    ℹ "Upload to SD Card" only stores the file for later. "Upload &amp; Flash" does both in one step from any connected device (phone included) — no separate Flash click needed — and reboots into that slot when done.
+    ℹ Picks a target slot, streams the file straight over WiFi into that slot's flash — no SD card, no separate step — and reboots into it automatically when done. Works from any connected device, phone included.
   </div>
 </div>
 
 <!-- Return to manager tip -->
-<div class="card card-c">
+<div class="card">
   <div class="card-title">↩ Return to Manager</div>
   <div style="font-size:.8rem;color:var(--dim);line-height:1.8">
     While another binary is running, return here by:<br>
-    <strong style="color:var(--txt)">①</strong> Hold <code style="color:var(--c4)">GPIO 0</code> LOW and press Reset button<br>
-    <strong style="color:var(--txt)">②</strong> From your app: include <code style="color:var(--c4)">ReturnToManager.h</code> and call <code style="color:var(--c4)">returnToManager()</code> — it sets the boot partition back to factory and restarts
+    <strong style="color:var(--txt)">①</strong> Hold <code style="color:var(--txt)">GPIO 0</code> LOW and press Reset button<br>
+    <strong style="color:var(--txt)">②</strong> From your app: include <code style="color:var(--txt)">ReturnToManager.h</code> and call <code style="color:var(--txt)">returnToManager()</code> — it sets the boot partition back to factory and restarts
   </div>
 </div>
 
 </div><!-- .wrap -->
 
-<!-- Flash progress modal -->
+<!-- Boot / erase modal -->
 <div class="modal" id="flashModal">
   <div class="spinner"></div>
-  <div class="modal-title" id="modalTitle">Flashing...</div>
-  <div class="modal-prog"><div class="modal-prog-fill" id="modalProgFill"></div></div>
-  <div class="modal-pct" id="modalPct">0%</div>
+  <div class="modal-title" id="modalTitle">Working...</div>
   <div class="modal-sub" id="modalSub">Do not power off. ESP32 will reboot automatically.</div>
 </div>
 
 <script>
 // ── Uptime counter ────────────────────────────────────────────────────────
-// FIX-18: this used to be a client-side Date.now() clock — that measured
-// "time since this page was opened", not actual device uptime, and reset
-// to 0 on every refresh despite the label implying otherwise. Now polls
-// the real millis()-based value the device reports via /status.
 function refreshUptime(){
   fetch('/status').then(function(r){ return r.json(); }).then(function(d){
     var s = d.uptime_s || 0;
@@ -774,7 +725,6 @@ setInterval(refreshUptime, 5000);
 var dz = document.getElementById('dropZone');
 var fi = document.getElementById('fileInput');
 var dzFname = document.getElementById('dzFname');
-var btnUpload = document.getElementById('btnUpload');
 var btnUploadFlashA = document.getElementById('btnUploadFlashA');
 var btnUploadFlashB = document.getElementById('btnUploadFlashB');
 
@@ -787,7 +737,6 @@ function setFile(file){
   fi._file = file;
   dzFname.textContent = file.name + '  (' + (file.size/1024).toFixed(1) + ' KB)';
   dzFname.style.display = 'block';
-  btnUpload.disabled = false;
   btnUploadFlashA.disabled = false;
   btnUploadFlashB.disabled = false;
 }
@@ -800,17 +749,18 @@ dz.addEventListener('drop', function(e){
   setFile(e.dataTransfer.files[0]);
 });
 
-// ── Upload to SD (and optionally flash straight into a slot) ───────────────
-// FEATURE: pass 'a' or 'b' to upload AND flash in one step — works from any
-// connected device (phone, laptop, whatever's on the AP/network), not just
-// the one that originally wrote the SD card. Call with no argument for the
-// old "SD card only" behavior.
 function resetUploadButtons(){
-  btnUpload.disabled = false;
   btnUploadFlashA.disabled = false;
   btnUploadFlashB.disabled = false;
 }
 
+// ── Upload → streams straight into the chosen slot's flash partition ──────
+// No SD card, no intermediate save step. The XHR upload progress IS the
+// flash progress (the server writes each chunk via esp_ota_write as it
+// arrives), so no separate polling/modal is needed — the browser's own
+// upload progress bar already reflects real write progress. The short gap
+// between "100% sent" and the server's final response is esp_ota_end()
+// verifying the image; that's shown as "Verifying..." below.
 function uploadFile(slot){
   var file = fi._file;
   if(!file){ alert('Select a .bin file first.'); return; }
@@ -818,113 +768,60 @@ function uploadFile(slot){
   var pf = document.getElementById('progFill');
   var pt = document.getElementById('progTxt');
   pw.style.display = 'block';
-  btnUpload.disabled = true;
   btnUploadFlashA.disabled = true;
   btnUploadFlashB.disabled = true;
   var fd = new FormData();
   fd.append('file', file, file.name);
   var xhr = new XMLHttpRequest();
-  xhr.open('POST', '/upload' + (slot ? ('?slot=' + slot) : ''));
-  // FIX-1: do NOT set an explicit Authorization header here. The browser
-  // already prompted for and cached Basic-Auth credentials when this page
-  // loaded (GET / requires auth) and auto-attaches them to same-origin
-  // XHR requests. Setting a header manually here used to send a blank
-  // password on every request, permanently overriding the correct cached
-  // credentials and making every upload fail with 401.
+  xhr.open('POST', '/upload?slot=' + slot);
+  // FIX-1: no explicit Authorization header — the browser already cached
+  // Basic-Auth credentials from loading "/" and auto-attaches them here.
   xhr.upload.onprogress = function(e){
     if(!e.lengthComputable) return;
     var pct = Math.round(e.loaded/e.total*100);
     pf.style.width = pct + '%';
-    pt.textContent = pct + '% — ' + (e.loaded/1024).toFixed(1)+' / '+(e.total/1024).toFixed(1)+' KB';
+    if(pct < 100){
+      pt.textContent = pct + '% — ' + (e.loaded/1024).toFixed(1)+' / '+(e.total/1024).toFixed(1)+' KB';
+    } else {
+      pt.textContent = 'Verifying and rebooting into Slot ' + slot.toUpperCase() + '...';
+    }
   };
   xhr.onload = function(){
-    if(xhr.status === 200 && slot){
-      pt.textContent = '✔ Uploaded — flashing into Slot ' + slot.toUpperCase() + '...';
-      watchFlashProgress(slot, 'Writing to flash. Do not power off.');
-    } else if(xhr.status === 200){
-      pt.textContent = '✔ Upload complete! Refreshing...';
-      setTimeout(function(){ location.reload(); }, 1200);
+    if(xhr.status === 200){
+      pt.textContent = 'Done. Rebooting into Slot ' + slot.toUpperCase() + '...';
     } else if(xhr.status === 401){
-      pt.textContent = '✖ Auth failed.';
+      pt.textContent = 'Auth failed.';
       resetUploadButtons();
-    } else if(xhr.status === 202){
-      pt.textContent = '⚠ ' + xhr.responseText;
+    } else if(xhr.status === 409){
+      pt.textContent = xhr.responseText;
       resetUploadButtons();
     } else {
-      pt.textContent = '✖ Upload failed: ' + xhr.responseText;
+      pt.textContent = 'Upload failed: ' + xhr.responseText;
       resetUploadButtons();
     }
   };
-  xhr.onerror = function(){ pt.textContent = '✖ Network error.'; resetUploadButtons(); };
+  xhr.onerror = function(){ pt.textContent = 'Network error.'; resetUploadButtons(); };
   xhr.send(fd);
-}
-
-// ── Shared flash-progress modal + poller ────────────────────────────────────
-// Used by both flashToSlot() (SD → slot) and uploadFile(slot) (upload → SD →
-// slot in one step) so the two flows don't duplicate this logic.
-function watchFlashProgress(slot, subText){
-  var modal = document.getElementById('flashModal');
-  var title = document.getElementById('modalTitle');
-  var sub   = document.getElementById('modalSub');
-  var fill  = document.getElementById('modalProgFill');
-  var pct   = document.getElementById('modalPct');
-  modal.classList.add('show');
-  title.textContent = 'Flashing to Slot ' + slot.toUpperCase() + '...';
-  sub.textContent   = subText || 'Writing to flash. Do not power off.';
-  fill.style.width  = '0%';
-  pct.textContent   = '0%';
-
-  var pollInterval = setInterval(function(){
-    fetch('/flash-progress')
-      .then(function(r){ return r.json(); })
-      .then(function(d){
-        var p = d.pct || 0;
-        fill.style.width = p + '%';
-        pct.textContent  = p + '%';
-        if(d.done){
-          clearInterval(pollInterval);
-          if(d.ok){
-            title.textContent = '✔ Flash Complete!';
-            sub.textContent   = 'Rebooting to Slot ' + slot.toUpperCase() + ' in 3 seconds...';
-            fill.style.width  = '100%';
-            pct.textContent   = '100%';
-          } else {
-            title.textContent = '✖ Flash Failed';
-            sub.textContent   = d.error || 'Unknown error. Binary may be corrupt.';
-            setTimeout(function(){ modal.classList.remove('show'); resetUploadButtons(); }, 4000);
-          }
-        }
-      }).catch(function(){ /* ignore poll errors during reboot */ });
-  }, 400);
-}
-
-// ── Flash SD binary to slot ───────────────────────────────────────────────
-function flashToSlot(filename, slot){
-  if(!confirm('Flash "' + filename + '" to Slot ' + slot.toUpperCase() + '?\n\nThis will overwrite the current binary in that slot.')) return;
-  watchFlashProgress(slot, 'Reading from SD, writing to flash. Do not power off.');
-  fetch('/flash?file=' + encodeURIComponent(filename) + '&slot=' + slot, {method:'POST'})
-    .catch(function(){ /* Device rebooted, connection closed — expected */ });
 }
 
 // ── Boot from slot (already flashed) ─────────────────────────────────────
 function bootSlot(slot){
-  if(!confirm('Boot from Slot ' + slot.toUpperCase() + '?\n\nManager will reboot into the flashed binary.')) return;
+  if(!confirm('Boot from Slot ' + slot.toUpperCase() + '?')) return;
   var modal = document.getElementById('flashModal');
   var title = document.getElementById('modalTitle');
   var sub   = document.getElementById('modalSub');
   modal.classList.add('show');
   title.textContent = 'Booting Slot ' + slot.toUpperCase() + '...';
-  sub.textContent   = 'Setting boot target and restarting. Page will not reload.';
+  sub.textContent   = 'Setting boot target and restarting.';
   fetch('/boot-slot?slot=' + slot, {method:'POST'})
     .catch(function(){ /* Expected — device rebooted */ });
 }
 
 // ── Erase slot ────────────────────────────────────────────────────────────
-// FIX-16: /erase-slot now runs on a background task and returns immediately
-// (202), so an instant reload would show stale "still flashed" state. Poll
-// /status until the slot actually reports empty (or give up after ~10s).
+// /erase-slot runs on a background task and returns immediately (202), so
+// poll /status until the slot actually reports empty (or give up after ~10s).
 function eraseSlot(slot){
-  if(!confirm('Erase Slot ' + slot.toUpperCase() + '?\n\nThe binary in this slot will be permanently removed.')) return;
+  if(!confirm('Erase Slot ' + slot.toUpperCase() + '? The binary in this slot will be permanently removed.')) return;
   fetch('/erase-slot?slot=' + slot, {method:'POST'})
     .then(function(r){ return r.text(); })
     .then(function(){
@@ -939,65 +836,10 @@ function eraseSlot(slot){
     })
     .catch(function(e){ alert('Error: ' + e); });
 }
-
-// ── Delete SD file ────────────────────────────────────────────────────────
-function deleteFile(name){
-  if(!confirm('Delete "' + name + '" from SD card?')) return;
-  fetch('/delete?file=' + encodeURIComponent(name), {method:'POST'})
-    .then(function(r){ return r.text(); })
-    .then(function(){ location.reload(); })
-    .catch(function(e){ alert('Error: ' + e); });
-}
 </script>
 </body>
 </html>
 )HTMLEOF";
-
-// ═══════════════════════════════════════════════════════════════════════════
-//   FLASH PROGRESS (for polling during SD→slot flash)
-//   (struct FlashProgress itself is defined near the top of the file — see
-//   the "FORWARD TYPE DEFINITIONS" block.)
-// ═══════════════════════════════════════════════════════════════════════════
-FlashProgress fp;
-
-// FIX-12: fp used to be read by handleFlashProgress() (loop()/server task)
-// while being written field-by-field by flashTask() (a separate FreeRTOS
-// task), with only pct/done/ok marked volatile and error[] entirely
-// unguarded. A poll landing mid-write of error[] could read a torn/partial
-// string. All access now goes through these two helpers, which take the
-// whole struct under one mutex — so a reader always sees either the
-// pre-write or fully-post-write state, never something in between.
-SemaphoreHandle_t fpMutex = NULL;
-
-void fpSet(uint8_t pct, bool done, bool ok, const char* errFmt = nullptr, ...) {
-  char buf[sizeof(fp.error)] = {0};
-  if (errFmt) {
-    va_list args;
-    va_start(args, errFmt);
-    vsnprintf(buf, sizeof(buf), errFmt, args);
-    va_end(args);
-  }
-  if (fpMutex) xSemaphoreTake(fpMutex, portMAX_DELAY);
-  fp.pct = pct;
-  fp.done = done;
-  fp.ok = ok;
-  if (errFmt) { memcpy(fp.error, buf, sizeof(fp.error)); }
-  if (fpMutex) xSemaphoreGive(fpMutex);
-}
-
-void fpSetPct(uint8_t pct) {
-  if (fpMutex) xSemaphoreTake(fpMutex, portMAX_DELAY);
-  fp.pct = pct;
-  if (fpMutex) xSemaphoreGive(fpMutex);
-}
-
-FlashProgress fpRead() {
-  FlashProgress copy;
-  if (fpMutex) xSemaphoreTake(fpMutex, portMAX_DELAY);
-  copy = fp;
-  if (fpMutex) xSemaphoreGive(fpMutex);
-  return copy;
-}
 
 // ═══════════════════════════════════════════════════════════════════════════
 //   HTML BUILDER
@@ -1006,11 +848,11 @@ String buildSlotBtns(const char* slot, SlotStatus status) {
   String s = "";
   if (status == SLOT_EMPTY) {
     // Can only flash from SD
-    s += "<span style='font-size:.72rem;color:var(--dim)'>Flash from SD to use</span>";
+    s += "<span style='font-size:.72rem;color:var(--dim)'>Upload a .bin below to use</span>";
   } else {
     // Flashed — can boot into it or erase it. (No "currently running" state
     // is possible here — see FIX-10 comment on getSlotStatus().)
-    s += "<button class='btn btn-success' onclick=\"bootSlot('" + String(slot) + "')\">⚡ Boot</button>";
+    s += "<button class='btn btn-primary' onclick=\"bootSlot('" + String(slot) + "')\">Boot</button>";
     s += "<button class='btn btn-danger' onclick=\"eraseSlot('" + String(slot) + "')\">Erase</button>";
   }
   return s;
@@ -1034,56 +876,6 @@ String buildPage() {
   String bTag     = (stB == SLOT_VALID) ? "READY" : "EMPTY";
   String bBtns    = buildSlotBtns("b", stB);
 
-  // ── SD binary list ───────────────────────────────────────────────────────
-  String binList = "";
-  if (!sdReady) {
-    binList = "<div class='empty-msg'>SD card not available. Check wiring and retry.</div>";
-  } else if (flashInProgress || eraseInProgress) {
-    // FIX-4/FIX-16: don't touch the SD card while the background flash or
-    // erase task owns it
-    binList = "<div class='empty-msg'>" + String(flashInProgress ? "Flash" : "Erase") +
-               " in progress — binary list will refresh after it completes.</div>";
-  } else if (!lockIO()) {
-    binList = "<div class='empty-msg'>SD card busy — try refreshing in a moment.</div>";
-  } else {
-    File root = SD.open(BINARIES_DIR);
-    if (!root || !root.isDirectory()) {
-      binList = "<div class='empty-msg'>No /binaries folder on SD. Upload a .bin file to create it.</div>";
-    } else {
-      int count = 0;
-      File f = root.openNextFile();
-      while (f) {
-        if (!f.isDirectory()) {
-          String nm = String(f.name());
-          // SD library may return full path on some cores
-          if (nm.indexOf('/') >= 0) nm = nm.substring(nm.lastIndexOf('/') + 1);
-          if (nm.endsWith(".bin")) {
-            count++;
-            size_t sz = f.size();
-            binList += "<div class='binitem'>";
-            binList += "<div class='bin-info'>";
-            binList += "<div class='bin-name'>" + nm + "</div>";
-            binList += "<div class='bin-meta'>" + fmtSize(sz) + "</div>";
-            binList += "</div>";
-            binList += "<div class='bin-btns'>";
-            // Flash to slot A or B buttons
-            binList += "<button class='btn btn-primary' onclick=\"flashToSlot('" + nm + "','a')\">→ Slot A</button>";
-            binList += "<button class='btn btn-success' onclick=\"flashToSlot('" + nm + "','b')\">→ Slot B</button>";
-            binList += "<button class='btn btn-danger' onclick=\"deleteFile('" + nm + "')\">✕</button>";
-            binList += "</div></div>";
-          }
-          f.close();
-        }
-        f = root.openNextFile();
-      }
-      root.close();
-      if (count == 0) {
-        binList = "<div class='empty-msg'>No .bin files on SD card.<br>Upload one using the section below.</div>";
-      }
-    }
-    unlockIO();
-  }
-
   // ── Assemble ─────────────────────────────────────────────────────────────
   String page = FPSTR(HTML_PAGE);
   String ip   = apMode ? WiFi.softAPIP().toString() : WiFi.localIP().toString();
@@ -1091,8 +883,6 @@ String buildPage() {
   page.replace("__WIFI_CLASS__",      apMode ? "warn" : "on");
   page.replace("__WIFI_MODE__",       apMode ? " AP Mode" : " Connected");
   page.replace("__IP__",              ip);
-  page.replace("__SD_CLASS__",        sdReady ? "on" : "off");
-  page.replace("__SD_STATUS__",       sdReady ? " Ready" : " Not Found");
   page.replace("__SLOT_A_CLASS__",    aClass);
   page.replace("__SLOT_A_NAME__",     aName);
   page.replace("__SLOT_A_TAG_CLASS__",aTagCls);
@@ -1103,7 +893,6 @@ String buildPage() {
   page.replace("__SLOT_B_TAG_CLASS__",bTagCls);
   page.replace("__SLOT_B_TAG__",      bTag);
   page.replace("__SLOT_B_BTNS__",     bBtns);
-  page.replace("__BIN_LIST__",        binList);
   return page;
 }
 
@@ -1118,250 +907,225 @@ void handleRoot() {
   server.send(200, "text/html", page);
 }
 
-// ── GET /flash-progress (polled by JS during flash) ──────────────────────
-// FIX-13: now requires auth like every other route. The browser already has
-// Basic-Auth credentials cached from loading "/" (which requires auth), so
-// these same-origin polls auto-attach them — no functional change for the
-// legitimate dashboard, just closes an unauthenticated info leak (SD
-// filenames could previously appear in the error field to anyone on the LAN).
-void handleFlashProgress() {
-  if (!checkAuth()) return;
-  FlashProgress snap = fpRead();  // FIX-12: one consistent snapshot under lock
-  String json = "{\"pct\":" + String(snap.pct)
-              + ",\"done\":" + (snap.done ? "true" : "false")
-              + ",\"ok\":"   + (snap.ok   ? "true" : "false")
-              + ",\"error\":\"" + String(snap.error) + "\"}";
-  server.send(200, "application/json", json);
-}
-
-// ── Context struct passed into the background flash task ───────────────────
-struct FlashTaskCtx {
-  char fname[128];
-  char slot;   // 'a' or 'b'
-};
-
 // FIX-15: esp_ota_abort() does NOT erase flash already written by prior
-// esp_ota_write() calls. If a flash fails partway through, the first
+// esp_ota_write() calls. If an upload fails partway through, the first
 // sector — which holds the magic byte getSlotStatus() treats as ground
 // truth — was already overwritten by the new (now-truncated) image. That
-// left a corrupt slot able to report "READY" in the UI, get boot-slotted
-// by the user, and crash-loop with no manager-side recovery. Erasing just
-// the header sector on any post-esp_ota_begin() failure guarantees the
-// slot unambiguously reports SLOT_EMPTY afterward instead of a false
-// "valid" — cheap (one 4KB sector) and doesn't need the full-partition
-// erase eraseTask() uses for a deliberate user-requested wipe.
+// would leave a corrupt slot able to report "READY" in the UI, get
+// boot-slotted by the user, and crash-loop with no manager-side recovery.
+// Erasing just the header sector on any post-esp_ota_begin() failure
+// guarantees the slot unambiguously reports SLOT_EMPTY afterward instead
+// of a false "valid" — cheap (one 4KB sector) and doesn't need the
+// full-partition erase eraseTask() uses for a deliberate user-requested wipe.
 void invalidateSlotHeader(const esp_partition_t* part) {
   if (!part) return;
   esp_err_t e = esp_partition_erase_range(part, 0, 4096);
   if (e != ESP_OK) {
-    Serial.printf("[FLASH] WARNING: header invalidate failed: 0x%X — slot state may be inconsistent\n", e);
+    Serial.printf("[UPLOAD] WARNING: header invalidate failed: 0x%X — slot state may be inconsistent\n", e);
   }
 }
 
-// ── Background flash task (FIX-2) ───────────────────────────────────────────
-// Runs on its own FreeRTOS task so loop()/server.handleClient() stays free
-// to serve /flash-progress polls WHILE the SD→OTA write is happening, and
-// so the eventual ESP.restart() doesn't cut off in-flight HTTP responses.
-void flashTask(void* param) {
-  FlashTaskCtx* ctx = (FlashTaskCtx*)param;
-  String fname(ctx->fname);
-  String slot = String(ctx->slot);
+// ── POST /upload?slot=a|b  →  streams straight into the OTA partition ─────
+// V1.4: no SD card in this design. Every byte the browser/phone sends is
+// handed to esp_ota_write() as it arrives — the same esp_ota_begin/write/end
+// sequence this manager always used, just fed from the live HTTP body
+// instead of a file. This runs synchronously inside the WebServer's own
+// request handling (the same pattern ArduinoOTA/esp_https_ota use for
+// streaming updates) — the HTTP request simply stays open for the duration
+// of the upload, exactly like any normal OTA update tool. server.handleClient()
+// resuming service to OTHER routes has to wait until this one finishes,
+// which is expected/intentional for a firmware write in progress.
+//
+// Stability note: esp_ota_begin() is given the real upload size (from the
+// Content-Length header, collected explicitly in setup() via
+// server.collectHeaders()) whenever available, so it erases only the
+// sectors the incoming image actually needs — not the whole partition.
+// Modern esp32-arduino cores yield periodically inside flash-erase loops,
+// so this does not trip the idle-task watchdog even for a ~1MB slot.
+static esp_ota_handle_t g_otaHandle       = 0;
+static const esp_partition_t* g_otaPart   = nullptr;
+static char   g_otaSlot                    = 0;      // 'a' or 'b'
+static bool   g_uploadAuthed               = false;
+static bool   g_otaBegun                   = false;
+static bool   g_uploadOk                   = false;
+static bool   g_firstChunkChecked          = false;
+static size_t g_uploadWritten              = 0;
+static String g_uploadFilename;
+static String g_uploadFailReason;
 
-  if (!lockIO(5000)) {
-    fpSet(0, true, false, "SD/NVS busy — could not start flash");
-    flashInProgress = false;
-    delete ctx;
-    vTaskDelete(NULL);
-    return;
-  }
+void handleUploadBody() {
+  HTTPUpload& up = server.upload();
 
-  const char* partName = (slot == "a") ? "slot_a" : "slot_b";
-  const esp_partition_t* targetPart = esp_partition_find_first(
-      ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_ANY, partName);
-  if (!targetPart) {
-    fpSet(0, true, false, "Partition '%s' not found in partition table", partName);
-    Serial.println("[FLASH] ERROR: Partition not found: " + String(partName));
-    goto cleanup;
-  }
+  if (up.status == UPLOAD_FILE_START) {
+    g_uploadAuthed      = false;
+    g_otaBegun           = false;
+    g_uploadOk            = false;
+    g_firstChunkChecked   = false;
+    g_uploadWritten       = 0;
+    g_uploadFailReason    = "";
+    g_otaHandle           = 0;
+    g_otaPart             = nullptr;
 
-  if (!sdReady) {
-    fpSet(0, true, false, "SD card not ready");
-    goto cleanup;
-  }
-  {
-    String fpath = String(BINARIES_DIR) + "/" + fname;
-    File binFile = SD.open(fpath, FILE_READ);
-    if (!binFile) {
-      fpSet(0, true, false, "File not found: %s", fpath.c_str());
-      Serial.println("[FLASH] ERROR: File not found: " + fpath);
-      goto cleanup;
+    if (!checkOrigin()) return;
+    if (!checkAuth()) return;      // Only check here — once per request
+    g_uploadAuthed = true;
+
+    if (flashInProgress || eraseInProgress) {
+      g_uploadFailReason = "A flash/erase operation is already in progress";
+      Serial.println("[UPLOAD] Rejected: flash/erase in progress");
+      return;
     }
 
-    size_t fileSize = binFile.size();
-    Serial.printf("[FLASH] File: %s  Size: %u bytes  Target: %s\n",
-                  fname.c_str(), fileSize, partName);
-
-    // ── Validation ─────────────────────────────────────────────────────────
-    if (fileSize < 65536) {
-      binFile.close();
-      fpSet(0, true, false, "File too small (%u bytes) — not a valid firmware", (unsigned)fileSize);
-      Serial.println("[FLASH] ERROR: file too small");
-      goto cleanup;
-    }
-    if (fileSize > targetPart->size) {
-      binFile.close();
-      fpSet(0, true, false, "File (%u B) exceeds slot size (%u B)",
-            (unsigned)fileSize, (unsigned)targetPart->size);
-      Serial.println("[FLASH] ERROR: file exceeds slot size");
-      goto cleanup;
-    }
-    uint8_t magic = 0;
-    binFile.read(&magic, 1);
-    binFile.seek(0);
-    if (magic != OTA_MAGIC_BYTE) {
-      binFile.close();
-      fpSet(0, true, false, "Invalid firmware header (got 0x%02X, expected 0xE9)", magic);
-      Serial.println("[FLASH] ERROR: bad magic byte");
-      goto cleanup;
+    String slot = server.arg("slot");
+    slot.toLowerCase();
+    if (slot != "a" && slot != "b") {
+      g_uploadFailReason = "Missing/invalid slot — must upload with ?slot=a or ?slot=b";
+      Serial.println("[UPLOAD] Rejected: bad slot param");
+      return;
     }
 
-    // ── Flash via esp_ota_* targeting the specific partition ────────────────
-    esp_ota_handle_t otaHandle = 0;
-    esp_err_t err = esp_ota_begin(targetPart, fileSize, &otaHandle);
+    String fname = sanitizeFilename(up.filename);
+    if (fname.length() == 0 || !fname.endsWith(".bin")) {
+      g_uploadFailReason = "Not a valid .bin filename";
+      Serial.println("[UPLOAD] Rejected: not a valid .bin filename");
+      return;
+    }
+
+    const char* partName = (slot == "a") ? "slot_a" : "slot_b";
+    g_otaPart = esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_ANY, partName);
+    if (!g_otaPart) {
+      g_uploadFailReason = "Partition '" + String(partName) + "' not found in partition table";
+      Serial.println("[UPLOAD] ERROR: partition not found: " + String(partName));
+      return;
+    }
+
+    if (!lockIO(5000)) {
+      g_uploadFailReason = "NVS busy — could not start upload";
+      Serial.println("[UPLOAD] Rejected: NVS busy");
+      return;
+    }
+    unlockIO();  // Only needed briefly for the prefs write at UPLOAD_FILE_END
+
+    // Use the real Content-Length when the client sent one (collected via
+    // server.collectHeaders() in setup()) so esp_ota_begin() only erases the
+    // sectors this image actually needs, instead of the whole partition.
+    size_t sizeHint = OTA_SIZE_UNKNOWN;
+    String cl = server.header("Content-Length");
+    if (cl.length() > 0) {
+      long clVal = cl.toInt();
+      // Multipart overhead (boundaries/headers) is a few hundred bytes at
+      // most — pad generously so esp_ota_begin never under-erases.
+      if (clVal > 1024) sizeHint = (size_t)clVal;
+    }
+
+    esp_err_t err = esp_ota_begin(g_otaPart, sizeHint, &g_otaHandle);
     if (err != ESP_OK) {
-      binFile.close();
-      fpSet(0, true, false, "esp_ota_begin failed: 0x%X", err);
-      Serial.println("[FLASH] ERROR: esp_ota_begin failed");
-      goto cleanup;
+      g_uploadFailReason = "esp_ota_begin failed: 0x" + String(err, HEX);
+      Serial.println("[UPLOAD] ERROR: esp_ota_begin failed");
+      return;
     }
+    g_otaBegun     = true;
+    g_otaSlot      = slot.charAt(0);
+    g_uploadFilename = fname;
+    g_uploadOk       = true;
+    flashInProgress  = true;
 
-    uint8_t* buf = (uint8_t*)malloc(FLASH_BUF_SIZE);
-    if (!buf) {
-      binFile.close(); esp_ota_abort(otaHandle);
-      fpSet(0, true, false, "Out of memory for flash buffer");
-      goto cleanup;
-    }
+    Serial.println("[UPLOAD] Start → slot_" + slot + "  file=" + fname +
+                    "  sizeHint=" + String((long)sizeHint));
+  }
 
-    size_t written = 0;
-    bool   flashErr = false;
-    while (binFile.available() && !flashErr) {
-      size_t toRead = min((size_t)FLASH_BUF_SIZE, (size_t)binFile.available());
-      size_t rd = binFile.read(buf, toRead);
-      if (rd == 0) break;
+  else if (up.status == UPLOAD_FILE_WRITE) {
+    if (!g_uploadAuthed || !g_uploadOk || !g_otaBegun) return;
 
-      err = esp_ota_write(otaHandle, buf, rd);
-      if (err != ESP_OK) {
-        fpSet(0, true, false, "esp_ota_write failed at offset %u: 0x%X", (unsigned)written, err);
-        Serial.println("[FLASH] ERROR: esp_ota_write failed");
-        flashErr = true;
-        break;
+    if (!g_firstChunkChecked) {
+      g_firstChunkChecked = true;
+      if (up.currentSize == 0 || up.buf[0] != OTA_MAGIC_BYTE) {
+        g_uploadFailReason = "Invalid firmware header (not a valid ESP32 image)";
+        Serial.println("[UPLOAD] ERROR: bad magic byte on first chunk");
+        esp_ota_abort(g_otaHandle);
+        invalidateSlotHeader(g_otaPart);
+        g_uploadOk = false;
+        return;
       }
-      written += rd;
-      fpSetPct((uint8_t)((uint32_t)written * 95UL / fileSize));
-      vTaskDelay(1);  // Yield to other tasks (WiFi stack, loop() HTTP handling)
-    }
-    free(buf);
-    binFile.close();
-
-    if (flashErr) {
-      esp_ota_abort(otaHandle);
-      invalidateSlotHeader(targetPart);   // FIX-15
-      prefs.begin(PREF_NS, false);
-      if (slot == "a") { prefs.remove(PREF_SLOT_A_NAME); slotAName = ""; }
-      else             { prefs.remove(PREF_SLOT_B_NAME); slotBName = ""; }
-      prefs.end();
-      goto cleanup;
     }
 
-    fpSetPct(97);
-    err = esp_ota_end(otaHandle);
+    esp_err_t err = esp_ota_write(g_otaHandle, up.buf, up.currentSize);
     if (err != ESP_OK) {
-      fpSet(97, true, false, "esp_ota_end (verify) failed: 0x%X — binary may be corrupt", err);
-      Serial.println("[FLASH] ERROR: esp_ota_end failed");
-      invalidateSlotHeader(targetPart);   // FIX-15
-      prefs.begin(PREF_NS, false);
-      if (slot == "a") { prefs.remove(PREF_SLOT_A_NAME); slotAName = ""; }
-      else             { prefs.remove(PREF_SLOT_B_NAME); slotBName = ""; }
-      prefs.end();
-      goto cleanup;
+      g_uploadFailReason = "esp_ota_write failed at offset " + String((unsigned)g_uploadWritten) +
+                            ": 0x" + String(err, HEX);
+      Serial.println("[UPLOAD] ERROR: esp_ota_write failed");
+      esp_ota_abort(g_otaHandle);
+      invalidateSlotHeader(g_otaPart);
+      g_uploadOk = false;
+      return;
+    }
+    g_uploadWritten += up.currentSize;
+  }
+
+  else if (up.status == UPLOAD_FILE_END) {
+    if (!g_uploadAuthed || !g_otaBegun) return;
+    if (!g_uploadOk) return;  // Already failed+aborted during WRITE above
+
+    if (g_uploadWritten < MIN_FW_SIZE) {
+      g_uploadFailReason = "File too small (" + String((unsigned)g_uploadWritten) + " bytes) — not valid firmware";
+      Serial.println("[UPLOAD] ERROR: file too small");
+      esp_ota_abort(g_otaHandle);
+      invalidateSlotHeader(g_otaPart);
+      g_uploadOk = false;
+      return;
     }
 
-    prefs.begin(PREF_NS, false);
-    if (slot == "a") { prefs.putString(PREF_SLOT_A_NAME, fname); slotAName = fname; }
-    else             { prefs.putString(PREF_SLOT_B_NAME, fname); slotBName = fname; }
-    prefs.putString(PREF_BOOT_TARGET, slot == "a" ? TARGET_SLOT_A : TARGET_SLOT_B);
-    prefs.end();
+    esp_err_t err = esp_ota_end(g_otaHandle);
+    if (err != ESP_OK) {
+      g_uploadFailReason = "esp_ota_end (verify) failed: 0x" + String(err, HEX) + " — binary may be corrupt";
+      Serial.println("[UPLOAD] ERROR: esp_ota_end failed");
+      invalidateSlotHeader(g_otaPart);
+      g_uploadOk = false;
+      return;
+    }
 
-    fpSet(100, true, true);
-    Serial.printf("[FLASH] Done! %u bytes → %s\n", written, partName);
+    String slot(g_otaSlot);
+    if (lockIO()) {
+      prefs.begin(PREF_NS, false);
+      if (slot == "a") { prefs.putString(PREF_SLOT_A_NAME, g_uploadFilename); slotAName = g_uploadFilename; }
+      else             { prefs.putString(PREF_SLOT_B_NAME, g_uploadFilename); slotBName = g_uploadFilename; }
+      prefs.putString(PREF_BOOT_TARGET, slot == "a" ? TARGET_SLOT_A : TARGET_SLOT_B);
+      prefs.putUChar(PREF_BOOT_FAILS, 0);   // Fresh unconfirmed-boot budget (mirrors FIX-17)
+      prefs.end();
+      unlockIO();
+    }
+
+    Serial.printf("[UPLOAD] Done! %u bytes → slot_%c\n", (unsigned)g_uploadWritten, g_otaSlot);
   }
 
-cleanup:
-  unlockIO();
-  flashInProgress = false;
-  delete ctx;
-  if (fpRead().ok) {
-    delay(600);  // Let one more /flash-progress poll pick up pct=100/done=true
-    ESP.restart();
+  else if (up.status == UPLOAD_FILE_ABORTED) {
+    if (g_otaBegun) {
+      esp_ota_abort(g_otaHandle);
+      if (g_uploadWritten > 0) invalidateSlotHeader(g_otaPart);
+    }
+    g_uploadOk = false;
+    g_uploadFailReason = "Upload aborted (connection lost)";
   }
-  vTaskDelete(NULL);
 }
 
-// ── POST /flash?file=xxx.bin&slot=a|b ────────────────────────────────────
-// Streams SD binary into the selected OTA partition on a background task.
-// FIX-2: async — HTTP handler returns immediately, /flash-progress now
-//        actually gets served in real time while flashing runs.
-// FIX-3: filename sanitized (path traversal was previously unguarded here).
-// FIX-4: flashInProgress guard rejects a second concurrent flash request.
-// FIX-7: CSRF origin check before any state-changing action.
-void handleFlash() {
-  if (!checkOrigin()) return;
-  if (!checkAuth()) return;
-  if (flashInProgress || eraseInProgress) {
-    server.send(409, "text/plain", "A flash/erase operation is already in progress");
-    return;
-  }
-  if (!server.hasArg("file") || !server.hasArg("slot")) {
-    server.send(400, "text/plain", "Missing file or slot parameter");
-    return;
-  }
-  String fname = sanitizeFilename(server.arg("file"));
-  String slot  = server.arg("slot");
-  slot.toLowerCase();
-  if (fname.length() == 0) {
-    server.send(400, "text/plain", "Invalid filename");
-    return;
-  }
-  if (slot != "a" && slot != "b") {
-    server.send(400, "text/plain", "slot must be 'a' or 'b'");
-    return;
-  }
-  if (fname.length() >= 120) {
-    server.send(400, "text/plain", "Filename too long");
+void handleUploadDone() {
+  flashInProgress = false;
+
+  if (!g_uploadAuthed) return;  // checkAuth()/checkOrigin() already sent the error response
+
+  if (!g_uploadOk) {
+    server.send(400, "text/plain", g_uploadFailReason.length() ? g_uploadFailReason : "Upload failed");
     return;
   }
 
-  fpSet(0, false, false, "");
-
-  FlashTaskCtx* ctx = new FlashTaskCtx();
-  strncpy(ctx->fname, fname.c_str(), sizeof(ctx->fname) - 1);
-  ctx->fname[sizeof(ctx->fname) - 1] = '\0';
-  ctx->slot = slot.charAt(0);
-
-  flashInProgress = true;
-  BaseType_t ok = xTaskCreate(flashTask, "flashTask", 8192, ctx, 1, NULL);
-  if (ok != pdPASS) {
-    flashInProgress = false;
-    delete ctx;
-    server.send(500, "text/plain", "Could not start flash task (low memory)");
-    return;
-  }
-
-  server.send(200, "text/plain", "Flashing started");
+  server.send(200, "text/plain", "Flashed into slot " + String(g_otaSlot) + " — rebooting...");
+  Serial.println("[UPLOAD] Rebooting into slot_" + String(g_otaSlot) + " in 1s");
+  delay(600);  // Let the HTTP response actually reach the client before restart
+  ESP.restart();
 }
 
 // ── POST /boot-slot?slot=a|b ──────────────────────────────────────────────
-// Boot from an already-flashed slot (no SD read needed — instant 2-3sec boot)
+// Boot from an already-flashed slot (instant 2-3sec boot)
 void handleBootSlot() {
   if (!checkOrigin()) return;
   if (!checkAuth()) return;
@@ -1482,176 +1246,6 @@ void handleEraseSlot() {
   server.send(202, "text/plain", "Erase started");
 }
 
-// ── POST /upload  → Save .bin file to SD card ─────────────────────────────
-// FIX-4: mutex-guarded against the async flash task touching SD at once.
-// FIX-5: auth (and CSRF origin) checked ONCE at UPLOAD_FILE_START, not on
-//        every multipart chunk — repeated checkAuth() failures used to be
-//        able to call server.send()/requestAuthentication() more than once
-//        mid-multipart-parse, leaving the response in an undefined state.
-// FIX-6: filename run through the same whitelist sanitizer used elsewhere.
-static File   g_uploadFile;
-static bool   g_uploadOk = false;
-static bool   g_uploadAuthed = false;
-static bool   g_uploadIOLocked = false;
-static String g_uploadPath;
-static String g_uploadFilename;   // bare filename, for the optional direct-flash step below
-
-void handleUploadBody() {
-  HTTPUpload& up = server.upload();
-
-  if (up.status == UPLOAD_FILE_START) {
-    g_uploadOk = false;
-    g_uploadAuthed = false;
-    g_uploadIOLocked = false;
-
-    if (!checkOrigin()) return;
-    if (!checkAuth()) return;      // Only check here — once per request
-    g_uploadAuthed = true;
-
-    if (flashInProgress || eraseInProgress) {
-      Serial.println("[UPLOAD] Rejected: flash/erase in progress");
-      return;
-    }
-
-    String fname = sanitizeFilename(up.filename);
-    if (fname.length() == 0 || !fname.endsWith(".bin")) {
-      Serial.println("[UPLOAD] Rejected: not a valid .bin filename");
-      return;  // g_uploadOk stays false — handleUploadDone sends 400
-    }
-    if (!sdReady) { Serial.println("[UPLOAD] Rejected: SD not ready"); return; }
-
-    if (!lockIO(5000)) {
-      Serial.println("[UPLOAD] Rejected: SD/NVS busy");
-      return;
-    }
-    g_uploadIOLocked = true;
-
-    // Ensure directory exists
-    if (!SD.exists(BINARIES_DIR)) SD.mkdir(BINARIES_DIR);
-
-    g_uploadPath = String(BINARIES_DIR) + "/" + fname;
-    if (SD.exists(g_uploadPath)) SD.remove(g_uploadPath);  // Overwrite existing
-    g_uploadFile = SD.open(g_uploadPath, FILE_WRITE);
-    if (!g_uploadFile) {
-      Serial.println("[UPLOAD] Cannot open file for write: " + g_uploadPath);
-      unlockIO();
-      g_uploadIOLocked = false;
-      return;
-    }
-    g_uploadFilename = fname;
-    Serial.println("[UPLOAD] Start → " + g_uploadPath);
-    g_uploadOk = true;
-  }
-  else if (up.status == UPLOAD_FILE_WRITE) {
-    if (!g_uploadAuthed) return;  // Never authenticated — ignore body chunks
-    if (g_uploadFile && g_uploadOk) {
-      size_t written = g_uploadFile.write(up.buf, up.currentSize);
-      if (written != up.currentSize) {
-        Serial.println("[UPLOAD] Write error — SD card full?");
-        g_uploadFile.close();
-        SD.remove(g_uploadPath);
-        g_uploadOk = false;
-      }
-    }
-  }
-  else if (up.status == UPLOAD_FILE_END) {
-    if (!g_uploadAuthed) return;
-    if (g_uploadFile) {
-      g_uploadFile.close();
-      Serial.printf("[UPLOAD] Done: %u bytes → %s\n", up.totalSize, g_uploadPath.c_str());
-      if (up.totalSize < 65536) {
-        Serial.println("[UPLOAD] Rejected: file too small after upload");
-        SD.remove(g_uploadPath);
-        g_uploadOk = false;
-      }
-    }
-    if (g_uploadIOLocked) { unlockIO(); g_uploadIOLocked = false; }
-  }
-  else if (up.status == UPLOAD_FILE_ABORTED) {
-    if (g_uploadFile) { g_uploadFile.close(); SD.remove(g_uploadPath); }
-    g_uploadOk = false;
-    if (g_uploadIOLocked) { unlockIO(); g_uploadIOLocked = false; }
-  }
-}
-
-void handleUploadDone() {
-  if (!g_uploadAuthed) return;  // checkAuth()/checkOrigin() already sent the error response
-  if (!g_uploadOk) {
-    server.send(400, "text/plain", "Upload failed or rejected (invalid file / SD error)");
-    return;
-  }
-
-  // FEATURE: one-step "upload from phone → flash directly into a slot".
-  // Client requests this by adding ?slot=a|b to the /upload URL. Internally
-  // it's still "save to SD, then flash from SD" (same trusted path as the
-  // manual two-click flow) — this just chains the two steps automatically
-  // so any connected device can push straight into a slot without a
-  // separate /flash click. Falls back to a plain "saved to SD" response if
-  // no slot was requested, or reports the conflict/OOM cases the same way
-  // handleFlash() does if a flash/erase is already running.
-  if (server.hasArg("slot")) {
-    String slot = server.arg("slot");
-    slot.toLowerCase();
-    if (slot == "a" || slot == "b") {
-      if (flashInProgress || eraseInProgress) {
-        server.send(202, "text/plain",
-                    "Saved to SD, but a flash/erase is already in progress — "
-                    "flash it manually from the dashboard once free.");
-        return;
-      }
-      FlashTaskCtx* ctx = new FlashTaskCtx();
-      strncpy(ctx->fname, g_uploadFilename.c_str(), sizeof(ctx->fname) - 1);
-      ctx->fname[sizeof(ctx->fname) - 1] = '\0';
-      ctx->slot = slot.charAt(0);
-
-      fpSet(0, false, false, "");
-      flashInProgress = true;
-      BaseType_t ok = xTaskCreate(flashTask, "flashTask", 8192, ctx, 1, NULL);
-      if (ok != pdPASS) {
-        flashInProgress = false;
-        delete ctx;
-        server.send(500, "text/plain", "Saved to SD, but could not start flash task (low memory)");
-        return;
-      }
-      server.send(200, "text/plain", "Uploaded — flashing into slot " + slot + " now");
-      return;
-    }
-  }
-
-  server.send(200, "text/plain", "Upload successful");
-}
-
-// ── POST /delete?file=xxx.bin ─────────────────────────────────────────────
-void handleDelete() {
-  if (!checkOrigin()) return;
-  if (!checkAuth()) return;
-  if (flashInProgress || eraseInProgress) {
-    server.send(409, "text/plain", "A flash/erase operation is in progress — try again shortly");
-    return;
-  }
-  if (!server.hasArg("file")) { server.send(400, "text/plain", "Missing file param"); return; }
-  String fname = sanitizeFilename(server.arg("file"));
-  if (fname.length() == 0) {
-    server.send(400, "text/plain", "Invalid filename");
-    return;
-  }
-  String fpath = String(BINARIES_DIR) + "/" + fname;
-
-  if (!lockIO()) {
-    server.send(503, "text/plain", "SD card busy — try again");
-    return;
-  }
-  if (!sdReady || !SD.exists(fpath)) {
-    unlockIO();
-    server.send(404, "text/plain", "File not found");
-    return;
-  }
-  SD.remove(fpath);
-  unlockIO();
-
-  Serial.println("[DELETE] " + fpath);
-  server.send(200, "text/plain", "Deleted: " + fname);
-}
 
 // ── GET /status ───────────────────────────────────────────────────────────
 void handleStatus() {
@@ -1664,7 +1258,6 @@ void handleStatus() {
   String ip = apMode ? WiFi.softAPIP().toString() : WiFi.localIP().toString();
   String json = "{\"ip\":\"" + ip + "\""
               + ",\"uptime_s\":" + String(millis() / 1000)  // FIX-18: real device uptime
-              + ",\"sd\":" + (sdReady ? "true" : "false")
               + ",\"ap_mode\":" + (apMode ? "true" : "false")
               + ",\"slot_a\":{\"status\":\"" + stStr(stA) + "\",\"name\":\"" + slotAName + "\"}"
               + ",\"slot_b\":{\"status\":\"" + stStr(stB) + "\",\"name\":\"" + slotBName + "\"}"
@@ -1787,11 +1380,9 @@ void setup() {
   delay(300);
   Serial.println("\n\n===== ESP32 MultiBoot Manager =====");
 
-  // FIX-4: create the shared SD/Preferences mutex before anything touches
-  // either, so it's guaranteed to exist once the WebServer + flash task
-  // start running concurrently.
+  // FIX-4: create the shared Preferences mutex before anything touches it,
+  // so it's guaranteed to exist once the WebServer starts handling requests.
   ioMutex = xSemaphoreCreateMutex();
-  fpMutex = xSemaphoreCreateMutex();  // FIX-12: guards the FlashProgress struct
 
   // ── Boot chain: may restart into a slot ──────────────────────────────────
   handleBootChain();
@@ -1804,21 +1395,6 @@ void setup() {
   prefs.end();
   Serial.println("[NVS] Slot A: " + (slotAName.length() ? slotAName : "(empty)"));
   Serial.println("[NVS] Slot B: " + (slotBName.length() ? slotBName : "(empty)"));
-
-  // ── SD Card ──────────────────────────────────────────────────────────────
-  SPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
-  if (!SD.begin(SD_CS)) {
-    Serial.println("[SD] Mount FAILED — check wiring (CS=" + String(SD_CS) + ")");
-    sdReady = false;
-  } else {
-    sdReady = true;
-    uint64_t cardMB = SD.cardSize() / (1024 * 1024);
-    Serial.printf("[SD] Ready — %lluMB\n", cardMB);
-    if (!SD.exists(BINARIES_DIR)) {
-      SD.mkdir(BINARIES_DIR);
-      Serial.println("[SD] Created " + String(BINARIES_DIR));
-    }
-  }
 
   // ── WiFi ─────────────────────────────────────────────────────────────────
   Serial.print("[WiFi] Connecting to: ");
@@ -1850,14 +1426,17 @@ void setup() {
     Serial.println("[DNS] Captive portal DNS started — connect to AP and the dashboard should open automatically");
   }
 
+  // Explicitly collect Content-Length so handleUploadBody() can read the
+  // real upload size via server.header("Content-Length") — WebServer does
+  // not expose headers unless they're requested up front like this.
+  const char* headersToCollect[] = { "Content-Length" };
+  server.collectHeaders(headersToCollect, 1);
+
   // ── Register routes ───────────────────────────────────────────────────────
   server.on("/",                HTTP_GET,  handleRoot);
   server.on("/status",          HTTP_GET,  handleStatus);
-  server.on("/flash-progress",  HTTP_GET,  handleFlashProgress);
-  server.on("/flash",           HTTP_POST, handleFlash);
   server.on("/boot-slot",       HTTP_POST, handleBootSlot);
   server.on("/erase-slot",      HTTP_POST, handleEraseSlot);
-  server.on("/delete",          HTTP_POST, handleDelete);
   server.on("/upload",          HTTP_POST, handleUploadDone, handleUploadBody);
   server.onNotFound(handleNotFound);
 
