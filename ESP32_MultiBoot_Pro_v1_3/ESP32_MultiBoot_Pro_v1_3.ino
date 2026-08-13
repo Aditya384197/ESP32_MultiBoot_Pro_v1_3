@@ -290,12 +290,12 @@ enum SlotStatus { SLOT_EMPTY, SLOT_VALID };
 // ═══════════════════════════════════════════════════════════════════════════
 //   CONFIG — Edit these
 // ═══════════════════════════════════════════════════════════════════════════
-const char* WIFI_SSID       = "YOUR_WIFI_SSID";
-const char* WIFI_PASSWORD   = "YOUR_WIFI_PASSWORD";
+const char* WIFI_SSID       = "Airtel_2.4GHz";
+const char* WIFI_PASSWORD   = "Kgf@0987";
 
 // Web UI Basic Auth credentials
 const char* AUTH_USER       = "admin";
-const char* AUTH_PASS       = "esp32boot";
+const char* AUTH_PASS       = "esp32";
 
 // AP fallback (if WiFi STA fails)
 // FIX-14: deliberately DIFFERENT from AUTH_PASS — these protect two
