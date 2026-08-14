@@ -1,246 +1,25 @@
 /*
- * ╔══════════════════════════════════════════════════════════════════════════╗
- * ║   ESP32 MULTIBOOT MANAGER — PRO                                        ║
- * ║   Dual-Slot Persistent Boot Manager — Direct WiFi Upload (No SD Card)  ║
- * ╠══════════════════════════════════════════════════════════════════════════╣
- * ║  CONCEPT                                                                ║
- * ║  This firmware lives in the FACTORY partition and is NEVER erased by   ║
- * ║  OTA operations. It manages two persistent OTA slots (A and B) which   ║
- * ║  can each hold a different application binary (~1.2MB each). A .bin    ║
- * ║  file is uploaded straight from a connected phone/PC over WiFi (AP or  ║
- * ║  home network) and streamed directly into the target slot's flash     ║
- * ║  partition as it arrives — no SD card, no intermediate storage. Once   ║
- * ║  a slot is flashed, booting from it takes only 2-3 seconds. The       ║
- * ║  manager itself always boots first; it checks a boot-flag in NVS and   ║
- * ║  either stays as manager or chains to the selected slot.               ║
- * ╠══════════════════════════════════════════════════════════════════════════╣
- * ║  V1.4 CHANGE: SD card module removed entirely. Earlier versions of     ║
- * ║  this file stored uploaded binaries on an SD card and flashed them     ║
- * ║  into a slot as a second step; that whole subsystem (SD.h/SPI.h,       ║
- * ║  BINARIES_DIR listing, /flash, /delete) is gone. Upload now writes     ║
- * ║  directly into the target esp_ota partition via esp_ota_begin/write/   ║
- * ║  end as each HTTP chunk arrives — the same trusted, well-tested API    ║
- * ║  this manager already used for the SD→slot write, just fed from the   ║
- * ║  live upload stream instead of a file. Historical FIX-N comments below ║
- * ║  describing the old SD-based flow are kept as-is for project history;  ║
- * ║  they describe behavior that no longer exists in this version.         ║
- * ╠══════════════════════════════════════════════════════════════════════════╣
- * ║  HARDWARE                                                               ║
- * ║  • ESP32 (4MB Flash minimum)                                           ║
- * ║  • (Optional) Button on GPIO 0 → GND = force manager mode at boot     ║
- * ╠══════════════════════════════════════════════════════════════════════════╣
- * ║  ARDUINO IDE / ARDUINODROID SETUP                                      ║
- * ║  Board          : ESP32 Dev Module                                     ║
- * ║  Partition Scheme: Custom (use partitions_multiboot.csv)               ║
- * ║  Flash Size     : 4MB                                                  ║
- * ║  Upload Speed   : 921600                                               ║
- * ║                                                                        ║
- * ║  CUSTOM PARTITION TABLE (partitions_multiboot.csv):                    ║
- * ║  nvs,     data, nvs,     0x9000,   0x5000                             ║
- * ║  otadata, data, ota,     0xe000,   0x2000                             ║
- * ║  manager, app,  factory, 0x10000,  0x100000 ← THIS firmware (1024KB) ║
- * ║  slot_a,  app,  ota_0,   0x110000, 0x130000  ← Persistent slot A     ║
- * ║  slot_b,  app,  ota_1,   0x240000, 0x130000  ← Persistent slot B     ║
- * ║  spiffs,  data, spiffs,  0x370000, 0x28000   ← Config/log (160KB)   ║
- * ║  (Grown from the original 960KB factory slot — the compiled manager  ║
- * ║  binary is ~1010KB, so 960KB overflowed by ~49KB. All partitions     ║
- * ║  after 'manager' shifted by +64KB to compensate; still fits in 4MB.) ║
- * ║                                                                        ║
- * ║  LIBRARIES (all built-in with ESP32 Arduino Core):                     ║
- * ║  WiFi, WebServer, SD, SPI, Update, Preferences, SPIFFS                ║
- * ║  esp_ota_ops.h, esp_partition.h (ESP-IDF, included via core)          ║
- * ╠══════════════════════════════════════════════════════════════════════════╣
- * ║  BOOT FLOW                                                              ║
- * ║  Power ON → Manager boots (factory partition, always first)            ║
- * ║     ├─ GPIO 0 held LOW? → Force manager mode (ignore boot target)     ║
- * ║     ├─ NVS boot_target == "manager"? → Stay in manager mode           ║
- * ║     ├─ NVS boot_target == "slot_a"? → esp_ota_set_boot_partition(A)  ║
- * ║     │      → ESP.restart() → Slot A boots (2-3 sec)                  ║
- * ║     └─ NVS boot_target == "slot_b"? → Same for slot B                ║
- * ║                                                                        ║
- * ║  Returning to Manager from a running app:                              ║
- * ║     • Physical: Hold GPIO 0 LOW and press Reset button                ║
- * ║     • Software: app includes ReturnToManager.h and calls              ║
- * ║       returnToManager() — this calls esp_ota_set_boot_partition() on  ║
- * ║       the factory partition directly (NOT an NVS flag — the           ║
- * ║       bootloader only reads otadata, see V1.2 changelog below) then   ║
- * ║       esp_restart(). ReturnToManager.h must be included by every app  ║
- * ║       you flash into slot_a/slot_b for this to work.                  ║
- * ╠══════════════════════════════════════════════════════════════════════════╣
- * ║  SECURITY                                                               ║
- * ║  Web UI protected by Basic Authentication (username + password).       ║
- * ║  Default: admin / esp32boot  — change in CONFIG section below.        ║
- * ║  All write operations (flash, upload, delete, erase) require auth.    ║
- * ╠══════════════════════════════════════════════════════════════════════════╣
- * ║  V1.0 — Production Grade                                               ║
- * ║  ✔ All original bugs fixed (see bug list below)                       ║
- * ║  ✔ Custom partition table with factory + dual OTA slots               ║
- * ║  ✔ Proper esp_ota_ops based slot flashing (not Update.h mismatch)    ║
- * ║  ✔ Magic byte (0xE9) + size validation before any flash               ║
- * ║  ✔ POST routes for all write operations (not GET)                     ║
- * ║  ✔ File handle cleanup (root.close(), file.close() everywhere)        ║
- * ║  ✔ Update.write() return value checked — abort on partial write       ║
- * ║  ✔ Chunked response for flash progress (no race with restart)         ║
- * ║  ✔ SD card fail detection with proper error reporting                 ║
- * ║  ✔ Upload: non-static file handles (no concurrent corruption)         ║
- * ║  ✔ Basic Auth on all write routes                                     ║
- * ║  ✔ GPIO 0 boot-pin for force-manager mode                             ║
- * ║  ✔ WiFi AP fallback if STA connect fails                              ║
- * ║  ✔ Slot status (empty/flashed/active) from esp_ota_ops               ║
- * ║  ✔ ESP32 Arduino Core 2.x + 3.x compatible                           ║
- * ╠══════════════════════════════════════════════════════════════════════════╣
- * ║  V1.1 — Audit Fixes (deep review pass)                                 ║
- * ║  ✔ FIX-1: Upload JS sent a hardcoded blank-password Authorization     ║
- * ║           header on every /upload XHR, permanently overriding the     ║
- * ║           browser's correctly cached Basic-Auth credentials →         ║
- * ║           upload always failed with 401. Removed the bad header;      ║
- * ║           browser now auto-attaches its cached creds.                 ║
- * ║  ✔ FIX-2: handleFlash() ran the entire SD→flash write + ESP.restart() ║
- * ║           synchronously inside the HTTP handler. WebServer is single- ║
- * ║           threaded, so /flash-progress polls could never be served    ║
- * ║           until AFTER the device had already restarted → progress bar ║
- * ║           never animated. Flashing now runs in a dedicated FreeRTOS   ║
- * ║           task; the HTTP handler returns immediately so loop() stays  ║
- * ║           free to serve /flash-progress polls in real time.           ║
- * ║  ✔ FIX-3: /flash accepted the SD filename with NO path-traversal      ║
- * ║           sanitization (unlike /delete, which had it). An authed      ║
- * ║           request with file=../something could read outside          ║
- * ║           /binaries. Same sanitization as /delete now applied.        ║
- * ║  ✔ FIX-4: No mutual exclusion between the new async flash task and    ║
- * ║           other handlers touching SD/NVS (/delete, /upload,           ║
- * ║           /erase-slot, page listing) → possible corruption if two     ║
- * ║           operations hit the SD card at the same time. Added a        ║
- * ║           shared FreeRTOS mutex (ioMutex) around every SD/Preferences ║
- * ║           access, plus a flashInProgress guard rejecting overlapping  ║
- * ║           /flash requests with 409.                                   ║
- * ║  ✔ FIX-5: handleUploadBody() called checkAuth() on every multipart    ║
- * ║           chunk. On repeated auth failure this could call             ║
- * ║           server.send()/requestAuthentication() more than once for   ║
- * ║           the same request mid-multipart-parse → undefined response   ║
- * ║           state. Auth is now checked once at UPLOAD_FILE_START only.  ║
- * ║  ✔ FIX-6: Uploaded filenames were only stripped of path separators,   ║
- * ║           not of quote/angle-bracket characters — a crafted filename  ║
- * ║           could break out of the onclick="..." JS string when listed  ║
- * ║           on the dashboard. Filenames are now whitelisted to          ║
- * ║           [A-Za-z0-9._-] before being written to SD.                  ║
- * ║  ✔ FIX-7: No CSRF protection on state-changing POST routes. Because   ║
- * ║           browsers auto-attach cached Basic-Auth credentials to       ║
- * ║           same-origin-looking simple POST requests, a page on any     ║
- * ║           other site could silently trigger /flash, /erase-slot,     ║
- * ║           /boot-slot, /delete against a logged-in admin's browser.    ║
- * ║           Added checkOrigin() — validates Origin/Referer against the  ║
- * ║           device's own current IP — on every write route.             ║
- * ║  ✔ FIX-8: No brute-force protection on Basic Auth — unlimited guesses ║
- * ║           at the password. Added a small per-IP failed-attempt        ║
- * ║           tracker with temporary lockout (mirrors the pattern used    ║
- * ║           in the weather-station V9-Secure hardening pass).           ║
- * ╠══════════════════════════════════════════════════════════════════════════╣
- * ║  V1.2 — Holistic Audit Fixes (root-cause pass, not patches)            ║
- * ║  ✔ FIX-9 (CSRF): checkOrigin() did indexOf() substring containment on  ║
- * ║           the Referer fallback — an attacker page whose own URL path   ║
- * ║           happened to contain the device's LAN IP (e.g.               ║
- * ║           evil.com/192.168.1.50/x.html) passed the check. Replaced     ║
- * ║           with exact host[:port] extraction + exact-match comparison. ║
- * ║           Also: previously, if BOTH Origin and Referer were absent,    ║
- * ║           the request was ALLOWED (fail-open). Now fails CLOSED —      ║
- * ║           no Origin/Referer on a state-changing route = rejected.      ║
- * ║  ✔ FIX-10 (dead code): SLOT_ACTIVE could never be observed by this     ║
- * ║           firmware — the manager only ever runs from the factory       ║
- * ║           partition, so esp_ota_get_running_partition() can never      ║
- * ║           equal slot_a/slot_b from inside manager code. Removed the    ║
- * ║           whole active-slot branch (enum, UI class, button logic).     ║
- * ║           Slots are now simply EMPTY or FLASHED — that matches what    ║
- * ║           the manager can actually know about itself.                 ║
- * ║  ✔ FIX-11 (boot logic — root cause): handleRebootToManager() and the   ║
- * ║           documented "app sets mbmgr/boot_tgt=manager + restart"       ║
- * ║           pattern only wrote a Preferences flag in a namespace the     ║
- * ║           BOOTLOADER never reads. The 2nd-stage ESP-IDF bootloader     ║
- * ║           decides which partition to boot from otadata — set purely   ║
- * ║           by esp_ota_set_boot_partition(). Once a slot has been        ║
- * ║           booted into, otadata still points at that slot forever       ║
- * ║           until something calls esp_ota_set_boot_partition() back to  ║
- * ║           the factory partition — writing an NVS flag the running     ║
- * ║           slot app doesn't even use does nothing to otadata. Net       ║
- * ║           effect: "return to manager" could silently just reboot back ║
- * ║           into the same slot app forever. Removed the unreachable      ║
- * ║           /reboot-manager route from the MANAGER (it can only ever be ║
- * ║           hit while the manager is already active — a slot app is     ║
- * ║           different firmware and cannot call a route on a server that ║
- * ║           isn't running). The actual "return" must happen from        ║
- * ║           WITHIN the slot app via the corrected ReturnToManager.h      ║
- * ║           (shipped separately), which now calls                       ║
- * ║           esp_ota_set_boot_partition() on the factory partition        ║
- * ║           itself before restarting — that's the only thing that       ║
- * ║           actually changes what the bootloader does next.             ║
- * ║  ✔ FIX-12 (data race): fp.error[80] was written by flashTask() and     ║
- * ║           read by handleFlashProgress() across two FreeRTOS tasks      ║
- * ║           with no synchronization (only pct/done/ok were volatile).    ║
- * ║           Added a dedicated fpMutex guarding every read/write of the   ║
- * ║           whole FlashProgress struct as one atomic unit.               ║
- * ║  ✔ FIX-13 (route hardening): /flash-progress was fully unauthenticated ║
- * ║           and could leak SD filenames via error strings to anyone on   ║
- * ║           the LAN. Now requires the same auth as every other route —   ║
- * ║           free for legitimate clients since the browser already        ║
- * ║           auto-attaches its cached Basic-Auth credentials to           ║
- * ║           same-origin polls.                                           ║
- * ║  ✔ FIX-14: AP_PASS defaulted to the exact same string as AUTH_PASS —   ║
- * ║           compromising one secret compromised both surfaces. Given     ║
- * ║           distinct defaults; both still must be changed before         ║
- * ║           deployment (unchanged architectural limit, see below).       ║
- * ╠══════════════════════════════════════════════════════════════════════════╣
- * ║  V1.3 — Deep Bug Hunt (system-breaker / invisible-bug pass)            ║
- * ║  ✔ FIX-15 (atomic integrity): esp_ota_abort() does NOT erase already-  ║
- * ║           written flash. A write failure mid-stream left the first     ║
- * ║           sector (magic byte) intact while the rest was truncated —    ║
- * ║           getSlotStatus() only checks the magic byte, so a corrupt     ║
- * ║           slot could still report "READY", get boot-slotted by the    ║
- * ║           user, and crash-loop with no manager-side recovery. Any      ║
- * ║           failure after esp_ota_begin() now erases the header sector   ║
- * ║           (invalidateSlotHeader()) and clears the slot's NVS name, so  ║
- * ║           a failed flash unambiguously reports SLOT_EMPTY afterward.   ║
- * ║  ✔ FIX-16 (watchdog/clean-up): /erase-slot erased up to 1.25MB         ║
- * ║           synchronously inside the HTTP handler — the same class of    ║
- * ║           server-blocking bug FIX-2 fixed for flashing, just missed    ║
- * ║           for erase. Moved to a background eraseTask() guarded by the  ║
- * ║           same ioMutex, with its own eraseInProgress flag combined     ║
- * ║           into every existing flashInProgress guard.                   ║
- * ║  ✔ FIX-17 (auto-recovery): GPIO0-hold-to-return only ever worked from  ║
- * ║           inside the MANAGER's own boot chain — which never runs once  ║
- * ║           otadata points at a slot. A slot app that crash-loops before ║
- * ║           calling returnToManager() had zero recovery path. Added      ║
- * ║           rtm_bootSafetyCheck()/rtm_markBootOK() to ReturnToManager.h: ║
- * ║           checks GPIO0 AND a consecutive-unconfirmed-boot counter,     ║
- * ║           auto-reverting to the manager after 3 unconfirmed restarts.  ║
- * ║           Honest limit: if a slot binary crashes before this call even ║
- * ║           executes, no software fix can help — serial reflash only.    ║
- * ║  ✔ FIX-18 (consistency): removed dead .slot.active/.tag-active CSS     ║
- * ║           left over from the FIX-10 SLOT_ACTIVE removal. Replaced the  ║
- * ║           client-side "Uptime" fake clock (Date.now() since page load, ║
- * ║           not device boot — reset on every refresh) with a real        ║
- * ║           millis()-based uptime_s field polled from /status.           ║
- * ║  ✔ FIX-19 (consistency/security): findLoginSlot() used to evict idle   ║
- * ║           (unlocked) tracking slots before locked ones — an attacker   ║
- * ║           rotating >8 source IPs could keep landing in fresh slots and ║
- * ║           reset their own fail counter for free. Now recycles a truly  ║
- * ║           idle slot first, and only evicts the soonest-to-expire       ║
- * ║           locked slot as last resort.                                  ║
- * ╠══════════════════════════════════════════════════════════════════════════╣
- * ║  KNOWN ARCHITECTURAL LIMITS (honestly scoped, not "fixed")             ║
- * ║  • No TLS — Basic Auth credentials travel in cleartext on the LAN.     ║
- * ║    ESP32 Arduino core has no lightweight HTTPS server suited to a      ║
- * ║    single .ino sketch; would need a full WiFiClientSecure rewrite.    ║
- * ║  • WebServer::authenticate() does a non-constant-time string compare  ║
- * ║    internally (library internal, not exposed for override) — a        ║
- * ║    timing side-channel remains theoretically possible on the LAN.      ║
- * ║  • Brute-force lockout counters live in RAM only — reset on reboot.   ║
- * ║  • checkOrigin() fail-closed means a non-browser API client (e.g.      ║
- * ║    another ESP32 app calling /flash with no Origin/Referer header)     ║
- * ║    will now be rejected by design — CSRF protection and "callable by   ║
- * ║    arbitrary scripts with no browser" are mutually exclusive goals.    ║
- * ║    If you need a non-browser caller, give it its own explicit auth     ║
- * ║    path — don't loosen checkOrigin() itself.                           ║
- * ╚══════════════════════════════════════════════════════════════════════════╝
+ * ESP32 MultiBoot Manager
+ * Dual-slot persistent boot manager — fully offline, WiFi Access Point only.
+ *
+ * Lives in the FACTORY partition. Manages two OTA slots (A and B), each
+ * holding one application binary. A .bin file is uploaded directly from a
+ * phone/PC connected to this device's own AP and streamed straight into the
+ * target slot's flash as it arrives. The manager always boots first; it
+ * checks NVS for a boot target and either stays as manager or chains into
+ * the selected slot. Hold GPIO 0 LOW at power-on to force manager mode.
+ *
+ * Partition table (partitions_multiboot.csv):
+ *   nvs,     data, nvs,     0x9000,   0x5000
+ *   otadata, data, ota,     0xe000,   0x2000
+ *   manager, app,  factory, 0x10000,  0x100000
+ *   slot_a,  app,  ota_0,   0x110000, 0x130000
+ *   slot_b,  app,  ota_1,   0x240000, 0x130000
+ *   spiffs,  data, spiffs,  0x370000, 0x28000
+ *
+ * Board: ESP32 Dev Module | Partition Scheme: Custom | Flash: 4MB
  */
+
 
 // ═══════════════════════════════════════════════════════════════════════════
 //   INCLUDES
@@ -327,7 +106,7 @@ const char* OTA_PASS_DEFAULT = "changeme-ota-2026";
 #define PREF_BOOT_TARGET "boot_tgt"
 #define PREF_SLOT_A_NAME "slot_a_nm"
 #define PREF_SLOT_B_NAME "slot_b_nm"
-// FIX-17: same key ReturnToManager.h's rtm_bootSafetyCheck() writes/reads in
+// Same key ReturnToManager.h's rtm_bootSafetyCheck() writes/reads in
 // the "mbmgr" namespace — manager resets it to 0 on any manually-requested
 // boot so the slot app gets a fresh unconfirmed-boot budget.
 #define PREF_BOOT_FAILS  "boot_fails"
@@ -361,7 +140,7 @@ String      apSsid;                // Loaded from NVS in setup() (falls back to 
 String      apPass;                // Loaded from NVS in setup() (falls back to AP_PASS_DEFAULT)
 String      otaUpdatePass;         // Loaded from NVS in setup() (falls back to OTA_PASS_DEFAULT)
 
-// ─── FIX-4: shared mutex — guards every prefs.* access so the upload/flash ─
+// ─── Shared mutex — guards every prefs.* access so the upload/flash ───────
 // handler and the synchronous WebServer handlers in loop() never touch NVS
 // at the same instant.
 SemaphoreHandle_t ioMutex = NULL;
@@ -373,14 +152,14 @@ void unlockIO() {
   if (ioMutex) xSemaphoreGive(ioMutex);
 }
 
-// ─── FIX-2/FIX-4: guards against a second upload/flash request while one ──
+// ─── Guards against a second upload/flash request while one is already ───
 // is already streaming into an OTA partition.
 volatile bool flashInProgress = false;
 
-// ─── FIX-16: same pattern as flashInProgress, for the now-async erase task ─
+// ─── Same pattern as flashInProgress, for the async erase task ───────────
 volatile bool eraseInProgress = false;
 
-// ─── FIX-8: lightweight per-IP brute-force lockout for Basic Auth ─────────
+// ─── Lightweight per-IP brute-force lockout for Basic Auth ───────────────
 // (struct LoginAttempt is defined near the top of the file — see the
 // "FORWARD TYPE DEFINITIONS" block — so it's already known before Arduino's
 // hoisted function prototypes need it.)
@@ -389,7 +168,7 @@ volatile bool eraseInProgress = false;
 #define LOGIN_LOCK_MS       30000UL
 LoginAttempt loginTrack[LOGIN_TRACK_SLOTS];
 
-// FIX-19: recycle a genuinely idle slot (never used, or used-but-clean)
+// Recycle a genuinely idle slot (never used, or used-but-clean)
 // first. Only fall back to evicting a currently-locked slot — picking the
 // one soonest to expire — as a last resort. The old version preferred
 // evicting UNLOCKED slots outright, which let an attacker rotating more
@@ -414,7 +193,7 @@ LoginAttempt* findLoginSlot(uint32_t ip) {
 }
 
 // ─── Slot status ────────────────────────────────────────────────────────────
-// FIX-10: there used to be a third state, SLOT_ACTIVE, for "this slot is the
+// There used to be a third state, SLOT_ACTIVE, for "this slot is the
 // currently running partition." That state can never actually be observed:
 // this manager binary lives permanently in the factory partition and is the
 // only code that ever calls getSlotStatus() — esp_ota_get_running_partition()
@@ -444,7 +223,7 @@ SlotStatus getSlotStatus(const char* partName) {
   return SLOT_EMPTY;
 }
 
-// ─── Auth helper (FIX-8: per-IP brute-force lockout added) ─────────────────
+// ─── Auth helper — per-IP brute-force lockout ─────────────────────────────
 bool checkAuth() {
   uint32_t ip = (uint32_t)server.client().remoteIP();
   LoginAttempt* slot = findLoginSlot(ip);
@@ -496,7 +275,7 @@ bool secureEquals(const String& a, const String& b) {
   return diff == 0;
 }
 
-// ─── FIX-9: CSRF guard — exact host match, fail-closed ─────────────────────
+// ─── CSRF guard — exact host match, fail-closed ───────────────────────────
 // Basic-Auth credentials, once cached by a browser, are auto-attached to any
 // same-origin-looking simple POST request — including one fired from a page
 // on a completely different site while the admin has this device open in
@@ -507,7 +286,7 @@ bool secureEquals(const String& a, const String& b) {
 //   "http://192.168.1.50/app/page?x=1"  ->  "192.168.1.50"
 //   "http://192.168.1.50:80/x"          ->  "192.168.1.50:80"
 // Deliberately does NOT use indexOf()/substring containment anywhere —
-// that was the FIX-9 bug: an attacker-controlled Referer path/query like
+// an attacker-controlled Referer path/query like
 // "http://evil.com/192.168.1.50/x.html" contains the device IP as a
 // substring without actually being it.
 String extractHost(const String& url) {
@@ -528,7 +307,7 @@ bool checkOrigin() {
   bool fromReferer = false;
   if (origin.length() == 0) { origin = server.header("Referer"); fromReferer = true; }
 
-  // FIX-9: fail CLOSED. A browser making a real same-origin request to this
+  // Fail CLOSED. A browser making a real same-origin request to this
   // page always sends at least one of these headers. Absence of both on a
   // state-changing route is treated as suspicious rather than trusted.
   if (origin.length() == 0) {
@@ -556,7 +335,7 @@ String fmtSize(size_t bytes) {
   return String(bytes / 1048576.0f, 2) + " MB";
 }
 
-// ─── FIX-3/FIX-6: single shared filename sanitizer ─────────────────────────
+// ─── Shared filename sanitizer ─────────────────────────────────────────────
 // Strips path components (traversal) AND whitelists characters so a crafted
 // filename can never break out of the onclick="..." JS string it's embedded
 // into on the dashboard. Returns "" if nothing safe survives.
@@ -873,7 +652,7 @@ function uploadFile(slot){
   fd.append('file', file, file.name);
   var xhr = new XMLHttpRequest();
   xhr.open('POST', '/upload?slot=' + slot);
-  // FIX-1: no explicit Authorization header — the browser already cached
+  // No explicit Authorization header — the browser already cached
   // Basic-Auth credentials from loading "/" and auto-attaches them here.
   xhr.upload.onprogress = function(e){
     if(!e.lengthComputable) return;
@@ -1044,7 +823,7 @@ String buildSlotBtns(const char* slot, SlotStatus status) {
     s += "<span style='font-size:.72rem;color:var(--dim)'>Upload a .bin below to use</span>";
   } else {
     // Flashed — can boot into it or erase it. (No "currently running" state
-    // is possible here — see FIX-10 comment on getSlotStatus().)
+    // is possible here — see the comment on getSlotStatus() above.)
     s += "<button class='btn btn-primary' onclick=\"bootSlot('" + String(slot) + "')\">Boot</button>";
     s += "<button class='btn btn-danger' onclick=\"eraseSlot('" + String(slot) + "')\">Erase</button>";
   }
@@ -1055,7 +834,7 @@ String buildPage() {
   SlotStatus stA = getSlotStatus("slot_a");
   SlotStatus stB = getSlotStatus("slot_b");
 
-  // ── Slot A strings (FIX-10: only EMPTY/VALID are reachable states) ───────
+  // ── Slot A strings (only EMPTY/VALID are reachable states) ─────────────
   String aName    = (stA == SLOT_EMPTY) ? "— Empty —" : (slotAName.length() ? slotAName : "Unknown");
   String aClass   = (stA == SLOT_VALID) ? "valid" : "empty";
   String aTagCls  = (stA == SLOT_VALID) ? "tag-valid" : "tag-empty";
@@ -1100,7 +879,7 @@ void handleRoot() {
   server.send(200, "text/html", page);
 }
 
-// FIX-15: esp_ota_abort() does NOT erase flash already written by prior
+// esp_ota_abort() does NOT erase flash already written by prior
 // esp_ota_write() calls. If an upload fails partway through, the first
 // sector — which holds the magic byte getSlotStatus() treats as ground
 // truth — was already overwritten by the new (now-truncated) image. That
@@ -1129,7 +908,7 @@ void invalidateSlotHeader(const esp_partition_t* part) {
 // resuming service to OTHER routes has to wait until this one finishes,
 // which is expected/intentional for a firmware write in progress.
 //
-// FIX-20 (stability — was causing "network error" after 100% upload):
+// Stability note — avoids a crash that previously caused a "network error"
 // esp_ota_begin() called with a KNOWN size erases ALL of that size's sectors
 // in one single blocking call, upfront, before a single byte is written.
 // For a ~1MB slot that single call can run long enough to starve the idle
@@ -1245,6 +1024,10 @@ void handleUploadBody() {
       return;
     }
     g_uploadWritten += up.currentSize;
+    delay(1);  // Yield after every flash write so WiFi/AP beacon timing isn't starved
+    if (g_uploadWritten % 65536 < up.currentSize) {  // Log roughly every 64KB
+      Serial.printf("[UPLOAD] %u KB written\n", (unsigned)(g_uploadWritten / 1024));
+    }
   }
 
   else if (up.status == UPLOAD_FILE_END) {
@@ -1275,7 +1058,7 @@ void handleUploadBody() {
       if (slot == "a") { prefs.putString(PREF_SLOT_A_NAME, g_uploadFilename); slotAName = g_uploadFilename; }
       else             { prefs.putString(PREF_SLOT_B_NAME, g_uploadFilename); slotBName = g_uploadFilename; }
       prefs.putString(PREF_BOOT_TARGET, slot == "a" ? TARGET_SLOT_A : TARGET_SLOT_B);
-      prefs.putUChar(PREF_BOOT_FAILS, 0);   // Fresh unconfirmed-boot budget (mirrors FIX-17)
+      prefs.putUChar(PREF_BOOT_FAILS, 0);   // Fresh unconfirmed-boot budget
       prefs.end();
       unlockIO();
     }
@@ -1358,6 +1141,7 @@ void handleSetAP() {
   apPass = newPass;
 
   bool ok = WiFi.softAP(apSsid.c_str(), apPass.c_str());
+  WiFi.setSleep(false);
   if (!ok) {
     server.send(500, "text/plain", "Saved, but applying the new AP settings failed — power-cycle the device to apply.");
     return;
@@ -1492,6 +1276,10 @@ void handleManagerUpdateBody() {
       return;
     }
     g_mgrWritten += up.currentSize;
+    delay(1);  // Yield after every flash write so WiFi/AP beacon timing isn't starved
+    if (g_mgrWritten % 65536 < up.currentSize) {
+      Serial.printf("[MGR-UPDATE] %u KB written\n", (unsigned)(g_mgrWritten / 1024));
+    }
   }
 
   else if (up.status == UPLOAD_FILE_END) {
@@ -1580,7 +1368,7 @@ void handleBootSlot() {
   }
   prefs.begin(PREF_NS, false);
   prefs.putString(PREF_BOOT_TARGET, slot == "a" ? TARGET_SLOT_A : TARGET_SLOT_B);
-  // FIX-17: fresh unconfirmed-boot budget every time a boot is deliberately
+  // Fresh unconfirmed-boot budget every time a boot is deliberately
   // requested from the dashboard, so rtm_bootSafetyCheck() in the slot app
   // doesn't inherit a stale fail count from a previous, unrelated session.
   prefs.putUChar(PREF_BOOT_FAILS, 0);
@@ -1594,10 +1382,10 @@ void handleBootSlot() {
   ESP.restart();
 }
 
-// ── Background erase task (FIX-16) ──────────────────────────────────────────
+// ── Background erase task ──────────────────────────────────────────────────
 // esp_partition_erase_range() on a ~1.25MB slot can take multiple seconds.
 // Running it inline inside the HTTP handler blocked server.handleClient()
-// for the whole duration — the exact class of bug FIX-2 fixed for flashing,
+// for the whole duration — the same class of bug the flash handler avoids,
 // just missed for erase. Moved to its own FreeRTOS task under the same
 // ioMutex, mirroring flashTask()'s structure.
 struct EraseTaskCtx {
@@ -1622,7 +1410,7 @@ void eraseTask(void* param) {
   if (!part) {
     Serial.println("[ERASE] ERROR: Partition not found: " + String(partName));
   } else {
-    // FIX-10: no "is this the running partition?" guard needed here — this
+    // No "is this the running partition?" guard needed here — this
     // task only ever runs while the manager (factory partition) is running,
     // so `part` (slot_a/slot_b) can never be the running partition in the
     // first place. See getSlotStatus() comment for the full reasoning.
@@ -1647,7 +1435,7 @@ void eraseTask(void* param) {
 }
 
 // ── POST /erase-slot?slot=a|b ─────────────────────────────────────────────
-// FIX-16: now starts a background task and returns immediately (202) instead
+// Starts a background task and returns immediately (202) instead
 // of blocking the WebServer for the whole erase duration.
 void handleEraseSlot() {
   if (!checkOrigin()) return;
@@ -1687,7 +1475,7 @@ void handleStatus() {
   };
   String ip = apMode ? WiFi.softAPIP().toString() : WiFi.localIP().toString();
   String json = "{\"ip\":\"" + ip + "\""
-              + ",\"uptime_s\":" + String(millis() / 1000)  // FIX-18: real device uptime
+              + ",\"uptime_s\":" + String(millis() / 1000)  // Real device uptime
               + ",\"ap_mode\":" + (apMode ? "true" : "false")
               + ",\"slot_a\":{\"status\":\"" + stStr(stA) + "\",\"name\":\"" + slotAName + "\"}"
               + ",\"slot_b\":{\"status\":\"" + stStr(stB) + "\",\"name\":\"" + slotBName + "\"}"
@@ -1695,7 +1483,7 @@ void handleStatus() {
   server.send(200, "application/json", json);
 }
 
-// FIX-11: there used to be a GET /reboot-manager handler here. It's removed
+// There used to be a GET /reboot-manager handler here. It's removed
 // — not just disabled — because it could never be legitimately reached: it
 // only exists on the manager's own WebServer, which is only running while
 // the manager itself is already active. A running slot_a/slot_b app is
@@ -1793,7 +1581,7 @@ void checkPendingPromotion() {
     Serial.println("[PROMOTE] ERROR: staged image larger than factory partition");
   } else {
     esp_ota_handle_t h = 0;
-    // FIX-20 (same class of bug as the upload handler): OTA_SIZE_UNKNOWN so
+    // Same fix as the upload handler — OTA_SIZE_UNKNOWN so
     // the erase happens lazily, one sector at a time, interleaved with the
     // write loop below (which already yields every 1KB) — never one long
     // blocking erase call that could starve the idle task during boot.
@@ -1920,7 +1708,7 @@ void setup() {
   delay(300);
   Serial.println("\n\n===== ESP32 MultiBoot Manager =====");
 
-  // FIX-4: create the shared Preferences mutex before anything touches it,
+  // Create the shared Preferences mutex before anything touches it,
   // so it's guaranteed to exist once the WebServer starts handling requests.
   ioMutex = xSemaphoreCreateMutex();
 
@@ -1951,6 +1739,12 @@ void setup() {
   apMode = true;
   WiFi.mode(WIFI_AP);
   WiFi.softAP(apSsid.c_str(), apPass.c_str());
+  // Disable WiFi modem sleep — with it enabled, any time the CPU is busy
+  // with a flash write for more than a few milliseconds (as OTA writes
+  // are), the radio can miss beacon/ack timing and the connected phone
+  // may drop the WiFi association mid-transfer. This keeps the radio
+  // fully awake and responsive throughout an upload.
+  WiFi.setSleep(false);
   Serial.println("[AP]   SSID: " + apSsid);
   Serial.println("[AP]   IP:   " + WiFi.softAPIP().toString());
 
