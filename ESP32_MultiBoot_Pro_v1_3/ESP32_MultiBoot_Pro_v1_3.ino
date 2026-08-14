@@ -290,19 +290,25 @@ enum SlotStatus { SLOT_EMPTY, SLOT_VALID };
 // ═══════════════════════════════════════════════════════════════════════════
 //   CONFIG — Edit these
 // ═══════════════════════════════════════════════════════════════════════════
-const char* WIFI_SSID       = "Airtel_2.4GHz";
-const char* WIFI_PASSWORD   = "Kgf@0987";
+// V1.5: fully offline. This device NEVER joins another WiFi network — it
+// always runs its own Access Point, so it works anywhere with no router/
+// internet dependency. SSID/password below are only the FIRST-BOOT defaults;
+// once changed from the Settings panel, the values actually used live in
+// NVS and these consts are never read again.
+const char* AP_SSID_DEFAULT = "ESP32-BootManager";
+const char* AP_PASS_DEFAULT = "bootmgr-ap-2026";
 
-// Web UI Basic Auth credentials
+// Web UI Basic Auth credentials (dashboard login)
 const char* AUTH_USER       = "admin";
-const char* AUTH_PASS       = "esp32";
+const char* AUTH_PASS       = "esp32boot";
 
-// AP fallback (if WiFi STA fails)
-// FIX-14: deliberately DIFFERENT from AUTH_PASS — these protect two
-// different surfaces (network join vs. web admin login); reusing one
-// secret for both means compromising either one compromises both.
-const char* AP_SSID         = "ESP32-BootManager";
-const char* AP_PASS         = "bootmgr-ap-2026";
+// V1.5: separate password specifically gating the "Update Manager Firmware"
+// action in Settings — deliberately independent of AUTH_PASS/AP_PASS so
+// compromising the dashboard login alone can't be used to overwrite the
+// manager itself. This is only the first-boot default; the Settings panel's
+// "Change OTA Password" flow (old → new → confirm) moves the real value
+// into NVS from then on.
+const char* OTA_PASS_DEFAULT = "changeme-ota-2026";
 
 // ═══════════════════════════════════════════════════════════════════════════
 //   PIN DEFINITIONS
@@ -325,6 +331,14 @@ const char* AP_PASS         = "bootmgr-ap-2026";
 // the "mbmgr" namespace — manager resets it to 0 on any manually-requested
 // boot so the slot app gets a fresh unconfirmed-boot budget.
 #define PREF_BOOT_FAILS  "boot_fails"
+#define PREF_AP_SSID     "ap_ssid"      // V1.5: user-configurable AP identity
+#define PREF_AP_PASS     "ap_pass"
+#define PREF_OTA_PASS    "ota_pass"     // V1.5: manager-self-update gate password
+// V1.5: two-stage safe manager self-update (see checkPendingPromotion()).
+// NVS key names are capped at 15 chars by the Preferences/NVS API — both
+// of these are well under that limit.
+#define PREF_PEND_PROMOTE "pend_promo"  // uint8: 1 = a promotion copy is due on this boot
+#define PREF_PEND_LEN     "pend_len"    // uint32: exact byte length to copy
 #define OTA_MAGIC_BYTE   0xE9        // Valid ESP32 image first byte
 #define DNS_PORT         53          // Captive-portal DNS (AP mode only)
 #define MIN_FW_SIZE      65536       // Reject anything smaller as "not real firmware"
@@ -343,6 +357,9 @@ Preferences prefs;
 bool        apMode         = false;
 String      slotAName      = "";   // Name of binary currently in slot A
 String      slotBName      = "";   // Name of binary currently in slot B
+String      apSsid;                // Loaded from NVS in setup() (falls back to AP_SSID_DEFAULT)
+String      apPass;                // Loaded from NVS in setup() (falls back to AP_PASS_DEFAULT)
+String      otaUpdatePass;         // Loaded from NVS in setup() (falls back to OTA_PASS_DEFAULT)
 
 // ─── FIX-4: shared mutex — guards every prefs.* access so the upload/flash ─
 // handler and the synchronous WebServer handlers in loop() never touch NVS
@@ -461,6 +478,22 @@ bool checkAuth() {
   slot->fails = 0;
   slot->lockUntil = 0;
   return true;
+}
+
+// V1.5: constant-time string compare for the separate OTA-update password
+// (dashboard Basic Auth already gets this from WebServer's own authenticate()
+// internals; this covers the plain-string comparisons the new Settings
+// routes below do against values stored in NVS).
+bool secureEquals(const String& a, const String& b) {
+  size_t lenA = a.length(), lenB = b.length();
+  size_t maxLen = (lenA > lenB) ? lenA : lenB;
+  uint8_t diff = (lenA == lenB) ? 0 : 1;
+  for (size_t i = 0; i < maxLen; i++) {
+    uint8_t ca = (i < lenA) ? (uint8_t)a[i] : 0;
+    uint8_t cb = (i < lenB) ? (uint8_t)b[i] : 0;
+    diff |= (ca ^ cb);
+  }
+  return diff == 0;
 }
 
 // ─── FIX-9: CSRF guard — exact host match, fail-closed ─────────────────────
@@ -631,13 +664,35 @@ h1{font-size:1.3rem;font-weight:700;letter-spacing:2px;text-transform:uppercase;
 /* Misc */
 .tip{font-size:.72rem;color:var(--dim);line-height:1.6;margin-top:10px;
      padding:8px 12px;background:var(--bg3);border-radius:6px;border-left:2px solid var(--line2)}
+/* Top bar + settings */
+.topbar{display:flex;justify-content:space-between;align-items:flex-start;gap:12px}
+.gear-btn{background:transparent;border:1px solid var(--line2);color:var(--txt);
+          width:34px;height:34px;flex-shrink:0;border-radius:8px;font-size:1rem;
+          cursor:pointer;transition:background-color .12s ease-out;line-height:1}
+.gear-btn:hover{background:var(--line)}
+.field-label{font-size:.68rem;color:var(--dim);display:block;margin-bottom:4px;
+             letter-spacing:.3px;text-transform:uppercase}
+.field{width:100%;background:var(--bg3);border:1px solid var(--line2);border-radius:6px;
+       color:var(--txt);padding:9px 11px;font-size:.82rem;margin-bottom:10px;
+       font-family:inherit}
+.field:focus{outline:none;border-color:var(--w)}
+.settings-sheet{max-width:480px;width:100%;background:var(--bg2);border:1px solid var(--line);
+                 border-radius:10px;padding:20px;position:relative;margin:auto}
+.close-x{position:absolute;top:14px;right:14px;background:none;border:none;color:var(--dim);
+         font-size:1.1rem;cursor:pointer;line-height:1;padding:4px}
+.close-x:hover{color:var(--w)}
 </style>
 </head>
 <body>
 <div class="wrap">
 
-<h1>MultiBoot Manager</h1>
-<div class="sub">ESP32 Dual-Slot Persistent Boot System</div>
+<div class="topbar">
+  <div>
+    <h1>MultiBoot Manager</h1>
+    <div class="sub">Fully Offline · ESP32 Dual-Slot Persistent Boot System</div>
+  </div>
+  <button class="gear-btn" onclick="openSettings()" aria-label="Settings" title="Settings">&#9881;</button>
+</div>
 
 <!-- Status Bar -->
 <div class="sbar">
@@ -706,6 +761,50 @@ h1{font-size:1.3rem;font-weight:700;letter-spacing:2px;text-transform:uppercase;
   <div class="spinner"></div>
   <div class="modal-title" id="modalTitle">Working...</div>
   <div class="modal-sub" id="modalSub">Do not power off. ESP32 will reboot automatically.</div>
+</div>
+
+<!-- Settings panel -->
+<div class="modal" id="settingsModal" style="align-items:flex-start;overflow-y:auto;padding:30px 12px">
+  <div class="settings-sheet">
+    <button class="close-x" onclick="closeSettings()" aria-label="Close">&#10005;</button>
+    <div class="card-title" style="margin-bottom:16px">Settings</div>
+
+    <div class="card">
+      <div class="card-title">Access Point</div>
+      <label class="field-label" for="apSsidInput">SSID</label>
+      <input type="text" id="apSsidInput" class="field" maxlength="31">
+      <label class="field-label" for="apPassInput">Password (min 8 characters)</label>
+      <input type="password" id="apPassInput" class="field" maxlength="63" placeholder="Leave to keep current">
+      <button class="btn btn-primary btn-lg" onclick="saveAP()">Save Access Point</button>
+      <div class="tip" id="apMsg" style="display:none"></div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">Change OTA Password</div>
+      <label class="field-label" for="otaOldPass">Current OTA Password</label>
+      <input type="password" id="otaOldPass" class="field">
+      <label class="field-label" for="otaNewPass">New OTA Password</label>
+      <input type="password" id="otaNewPass" class="field">
+      <label class="field-label" for="otaConfirmPass">Confirm New Password</label>
+      <input type="password" id="otaConfirmPass" class="field">
+      <button class="btn btn-primary btn-lg" onclick="saveOtaPass()">Change Password</button>
+      <div class="tip" id="otaPassMsg" style="display:none"></div>
+    </div>
+
+    <div class="card" style="margin-bottom:0">
+      <div class="card-title">Update Manager Firmware</div>
+      <div class="tip">Uses Slot B as temporary staging — its current content is overwritten during the update. The manager restarts automatically once done.</div>
+      <label class="field-label" style="margin-top:10px" for="mgrFileInput">Manager .bin File</label>
+      <input type="file" id="mgrFileInput" class="field" accept=".bin">
+      <label class="field-label" for="mgrOtaPass">OTA Update Password</label>
+      <input type="password" id="mgrOtaPass" class="field">
+      <div class="prog-wrap" id="mgrProgWrap">
+        <div class="prog-track"><div class="prog-fill" id="mgrProgFill"></div></div>
+        <div class="prog-txt" id="mgrProgTxt"></div>
+      </div>
+      <button class="btn btn-primary btn-lg" id="mgrUpdateBtn" onclick="updateManager()">Upload &amp; Update Manager</button>
+    </div>
+  </div>
 </div>
 
 <script>
@@ -836,6 +935,100 @@ function eraseSlot(slot){
     })
     .catch(function(e){ alert('Error: ' + e); });
 }
+
+// ── Settings panel ──────────────────────────────────────────────────────────
+function openSettings(){
+  document.getElementById('settingsModal').classList.add('show');
+  fetch('/settings').then(function(r){ return r.json(); }).then(function(d){
+    document.getElementById('apSsidInput').value = d.ap_ssid || '';
+  }).catch(function(){ /* ignore — user can still type a new SSID */ });
+}
+function closeSettings(){
+  document.getElementById('settingsModal').classList.remove('show');
+}
+
+function showMsg(id, text, ok){
+  var el = document.getElementById(id);
+  el.style.display = 'block';
+  el.textContent = text;
+  el.style.borderLeftColor = ok ? 'var(--w)' : 'var(--dim2)';
+}
+
+function saveAP(){
+  var ssid = document.getElementById('apSsidInput').value;
+  var pass = document.getElementById('apPassInput').value;
+  if(!ssid){ showMsg('apMsg', 'SSID is required.', false); return; }
+  if(!pass || pass.length < 8){ showMsg('apMsg', 'Password must be at least 8 characters.', false); return; }
+  var fd = new URLSearchParams();
+  fd.append('ssid', ssid);
+  fd.append('pass', pass);
+  fetch('/settings/ap', {method:'POST', body: fd})
+    .then(function(r){ return r.text().then(function(t){ return {ok:r.ok, text:t}; }); })
+    .then(function(res){ showMsg('apMsg', res.text, res.ok); })
+    .catch(function(){ showMsg('apMsg', 'Network error.', false); });
+}
+
+function saveOtaPass(){
+  var oldP = document.getElementById('otaOldPass').value;
+  var newP = document.getElementById('otaNewPass').value;
+  var confP = document.getElementById('otaConfirmPass').value;
+  if(!oldP || !newP || !confP){ showMsg('otaPassMsg', 'All three fields are required.', false); return; }
+  if(newP.length < 8){ showMsg('otaPassMsg', 'New password must be at least 8 characters.', false); return; }
+  if(newP !== confP){ showMsg('otaPassMsg', 'New password and confirmation do not match.', false); return; }
+  var fd = new URLSearchParams();
+  fd.append('oldPass', oldP);
+  fd.append('newPass', newP);
+  fd.append('confirmPass', confP);
+  fetch('/settings/ota-password', {method:'POST', body: fd})
+    .then(function(r){ return r.text().then(function(t){ return {ok:r.ok, text:t}; }); })
+    .then(function(res){
+      showMsg('otaPassMsg', res.text, res.ok);
+      if(res.ok){
+        document.getElementById('otaOldPass').value = '';
+        document.getElementById('otaNewPass').value = '';
+        document.getElementById('otaConfirmPass').value = '';
+      }
+    })
+    .catch(function(){ showMsg('otaPassMsg', 'Network error.', false); });
+}
+
+function updateManager(){
+  var fi2 = document.getElementById('mgrFileInput');
+  var file = fi2.files[0];
+  var otapass = document.getElementById('mgrOtaPass').value;
+  if(!file){ alert('Select the new manager .bin file first.'); return; }
+  if(!otapass){ alert('Enter the OTA update password.'); return; }
+  if(!confirm('Update the manager firmware? Slot B will be temporarily overwritten during this process.')) return;
+
+  var pw = document.getElementById('mgrProgWrap');
+  var pf = document.getElementById('mgrProgFill');
+  var pt = document.getElementById('mgrProgTxt');
+  var btn = document.getElementById('mgrUpdateBtn');
+  pw.style.display = 'block';
+  btn.disabled = true;
+
+  var fd = new FormData();
+  fd.append('file', file, file.name);
+  var xhr = new XMLHttpRequest();
+  xhr.open('POST', '/manager-update?otapass=' + encodeURIComponent(otapass));
+  xhr.upload.onprogress = function(e){
+    if(!e.lengthComputable) return;
+    var pct = Math.round(e.loaded/e.total*100);
+    pf.style.width = pct + '%';
+    pt.textContent = pct < 100 ? (pct + '%') : 'Verifying and rebooting...';
+  };
+  xhr.onload = function(){
+    if(xhr.status === 200){
+      pt.textContent = 'Update staged. Rebooting to complete...';
+      setTimeout(function(){ closeSettings(); }, 2000);
+    } else {
+      pt.textContent = 'Failed: ' + xhr.responseText;
+      btn.disabled = false;
+    }
+  };
+  xhr.onerror = function(){ pt.textContent = 'Network error.'; btn.disabled = false; };
+  xhr.send(fd);
+}
 </script>
 </body>
 </html>
@@ -936,12 +1129,17 @@ void invalidateSlotHeader(const esp_partition_t* part) {
 // resuming service to OTHER routes has to wait until this one finishes,
 // which is expected/intentional for a firmware write in progress.
 //
-// Stability note: esp_ota_begin() is given the real upload size (from the
-// Content-Length header, collected explicitly in setup() via
-// server.collectHeaders()) whenever available, so it erases only the
-// sectors the incoming image actually needs — not the whole partition.
-// Modern esp32-arduino cores yield periodically inside flash-erase loops,
-// so this does not trip the idle-task watchdog even for a ~1MB slot.
+// FIX-20 (stability — was causing "network error" after 100% upload):
+// esp_ota_begin() called with a KNOWN size erases ALL of that size's sectors
+// in one single blocking call, upfront, before a single byte is written.
+// For a ~1MB slot that single call can run long enough to starve the idle
+// task on that core past the default watchdog timeout — the device panics
+// and reboots mid-request, which the browser reports as "network error"
+// right after it finished sending (it has no way to know the server side
+// crashed). Passing OTA_SIZE_UNKNOWN instead makes esp_ota_write() erase
+// lazily, one 4KB sector at a time, only as newly-written data actually
+// crosses into it — spread naturally across every ~1.4KB HTTP chunk instead
+// of one multi-second block, which keeps the idle task fed throughout.
 static esp_ota_handle_t g_otaHandle       = 0;
 static const esp_partition_t* g_otaPart   = nullptr;
 static char   g_otaSlot                    = 0;      // 'a' or 'b'
@@ -1006,19 +1204,7 @@ void handleUploadBody() {
     }
     unlockIO();  // Only needed briefly for the prefs write at UPLOAD_FILE_END
 
-    // Use the real Content-Length when the client sent one (collected via
-    // server.collectHeaders() in setup()) so esp_ota_begin() only erases the
-    // sectors this image actually needs, instead of the whole partition.
-    size_t sizeHint = OTA_SIZE_UNKNOWN;
-    String cl = server.header("Content-Length");
-    if (cl.length() > 0) {
-      long clVal = cl.toInt();
-      // Multipart overhead (boundaries/headers) is a few hundred bytes at
-      // most — pad generously so esp_ota_begin never under-erases.
-      if (clVal > 1024) sizeHint = (size_t)clVal;
-    }
-
-    esp_err_t err = esp_ota_begin(g_otaPart, sizeHint, &g_otaHandle);
+    esp_err_t err = esp_ota_begin(g_otaPart, OTA_SIZE_UNKNOWN, &g_otaHandle);
     if (err != ESP_OK) {
       g_uploadFailReason = "esp_ota_begin failed: 0x" + String(err, HEX);
       Serial.println("[UPLOAD] ERROR: esp_ota_begin failed");
@@ -1030,8 +1216,7 @@ void handleUploadBody() {
     g_uploadOk       = true;
     flashInProgress  = true;
 
-    Serial.println("[UPLOAD] Start → slot_" + slot + "  file=" + fname +
-                    "  sizeHint=" + String((long)sizeHint));
+    Serial.println("[UPLOAD] Start → slot_" + slot + "  file=" + fname);
   }
 
   else if (up.status == UPLOAD_FILE_WRITE) {
@@ -1121,6 +1306,251 @@ void handleUploadDone() {
   server.send(200, "text/plain", "Flashed into slot " + String(g_otaSlot) + " — rebooting...");
   Serial.println("[UPLOAD] Rebooting into slot_" + String(g_otaSlot) + " in 1s");
   delay(600);  // Let the HTTP response actually reach the client before restart
+  ESP.restart();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//   SETTINGS — AP credentials, OTA password, manager self-update
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ── GET /settings ──────────────────────────────────────────────────────────
+// Returns current, non-secret settings for the panel to pre-fill. Passwords
+// are never sent back — only whether one is currently set (always true here,
+// both have first-boot defaults).
+void handleGetSettings() {
+  if (!checkAuth()) return;
+  String json = "{\"ap_ssid\":\"" + apSsid + "\"}";
+  server.send(200, "application/json", json);
+}
+
+// ── POST /settings/ap  (ssid, pass) ────────────────────────────────────────
+// Changes the AP's own SSID/password and applies it immediately via
+// WiFi.softAP() — no reboot needed, existing connections just get dropped
+// and can rejoin under the new name/password right away.
+void handleSetAP() {
+  if (!checkOrigin()) return;
+  if (!checkAuth()) return;
+
+  String newSsid = server.arg("ssid");
+  String newPass = server.arg("pass");
+  newSsid.trim();
+
+  if (newSsid.length() < 1 || newSsid.length() > 31) {
+    server.send(400, "text/plain", "SSID must be 1-31 characters");
+    return;
+  }
+  if (newPass.length() < 8 || newPass.length() > 63) {
+    server.send(400, "text/plain", "Password must be 8-63 characters (WPA2 requirement)");
+    return;
+  }
+
+  if (!lockIO(3000)) {
+    server.send(503, "text/plain", "NVS busy — try again");
+    return;
+  }
+  prefs.begin(PREF_NS, false);
+  prefs.putString(PREF_AP_SSID, newSsid);
+  prefs.putString(PREF_AP_PASS, newPass);
+  prefs.end();
+  unlockIO();
+
+  apSsid = newSsid;
+  apPass = newPass;
+
+  bool ok = WiFi.softAP(apSsid.c_str(), apPass.c_str());
+  if (!ok) {
+    server.send(500, "text/plain", "Saved, but applying the new AP settings failed — power-cycle the device to apply.");
+    return;
+  }
+
+  Serial.println("[AP] SSID/password changed → " + apSsid);
+  server.send(200, "text/plain", "Access Point updated. Reconnect using the new SSID/password.");
+}
+
+// ── POST /settings/ota-password  (oldPass, newPass, confirmPass) ──────────
+void handleChangeOtaPass() {
+  if (!checkOrigin()) return;
+  if (!checkAuth()) return;
+
+  String oldPass     = server.arg("oldPass");
+  String newPass     = server.arg("newPass");
+  String confirmPass = server.arg("confirmPass");
+
+  if (!secureEquals(oldPass, otaUpdatePass)) {
+    server.send(401, "text/plain", "Current OTA password is incorrect");
+    return;
+  }
+  if (newPass.length() < 8 || newPass.length() > 63) {
+    server.send(400, "text/plain", "New password must be at least 8 characters");
+    return;
+  }
+  if (!secureEquals(newPass, confirmPass)) {
+    server.send(400, "text/plain", "New password and confirmation do not match");
+    return;
+  }
+
+  if (!lockIO(3000)) {
+    server.send(503, "text/plain", "NVS busy — try again");
+    return;
+  }
+  prefs.begin(PREF_NS, false);
+  prefs.putString(PREF_OTA_PASS, newPass);
+  prefs.end();
+  unlockIO();
+
+  otaUpdatePass = newPass;
+  Serial.println("[OTA] Update password changed");
+  server.send(200, "text/plain", "OTA update password changed");
+}
+
+// ── POST /manager-update?otapass=xxx  →  Hop 1 of the self-update ─────────
+// Streams a new manager .bin into slot_b (always — never directly into the
+// running "manager" partition, see checkPendingPromotion() for why) and
+// marks it for promotion on next boot. Requires BOTH the normal dashboard
+// login (checkAuth) AND the separate OTA password, since this is the one
+// action that can affect the manager itself.
+static bool   g_mgrOriginAuthOk  = false;  // true once checkOrigin()+checkAuth() both pass (they self-respond on failure — must not send again)
+static bool   g_mgrUpdateAuthed  = false;  // true once the OTA password ALSO checks out
+static bool   g_mgrUpdateOk      = false;
+static bool   g_mgrFirstChecked  = false;
+static size_t g_mgrWritten       = 0;
+static String g_mgrFailReason;
+
+void handleManagerUpdateBody() {
+  HTTPUpload& up = server.upload();
+
+  if (up.status == UPLOAD_FILE_START) {
+    g_mgrOriginAuthOk = false;
+    g_mgrUpdateAuthed = false;
+    g_mgrUpdateOk      = false;
+    g_mgrFirstChecked  = false;
+    g_mgrWritten       = 0;
+    g_mgrFailReason    = "";
+    g_otaHandle        = 0;
+    g_otaPart          = nullptr;
+
+    if (!checkOrigin()) return;   // Already sent its own error response
+    if (!checkAuth())   return;   // Already sent its own error response
+    g_mgrOriginAuthOk = true;     // From here on, nothing has responded yet —
+                                   // handleManagerUpdateDone() owns the response.
+
+    if (!secureEquals(server.arg("otapass"), otaUpdatePass)) {
+      g_mgrFailReason = "Incorrect OTA update password";
+      Serial.println("[MGR-UPDATE] Rejected: bad OTA password");
+      return;
+    }
+    g_mgrUpdateAuthed = true;
+
+    if (flashInProgress || eraseInProgress) {
+      g_mgrFailReason = "A flash/erase operation is already in progress";
+      return;
+    }
+
+    String fname = sanitizeFilename(up.filename);
+    if (fname.length() == 0 || !fname.endsWith(".bin")) {
+      g_mgrFailReason = "Not a valid .bin filename";
+      return;
+    }
+
+    g_otaPart = esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_ANY, "slot_b");
+    if (!g_otaPart) {
+      g_mgrFailReason = "Staging partition 'slot_b' not found";
+      Serial.println("[MGR-UPDATE] ERROR: slot_b partition not found");
+      return;
+    }
+
+    esp_err_t err = esp_ota_begin(g_otaPart, OTA_SIZE_UNKNOWN, &g_otaHandle);
+    if (err != ESP_OK) {
+      g_mgrFailReason = "esp_ota_begin failed: 0x" + String(err, HEX);
+      return;
+    }
+    g_mgrUpdateOk   = true;
+    flashInProgress = true;
+    Serial.println("[MGR-UPDATE] Staging new manager firmware into slot_b: " + fname);
+  }
+
+  else if (up.status == UPLOAD_FILE_WRITE) {
+    if (!g_mgrUpdateAuthed || !g_mgrUpdateOk) return;
+
+    if (!g_mgrFirstChecked) {
+      g_mgrFirstChecked = true;
+      if (up.currentSize == 0 || up.buf[0] != OTA_MAGIC_BYTE) {
+        g_mgrFailReason = "Invalid firmware header (not a valid ESP32 image)";
+        esp_ota_abort(g_otaHandle);
+        invalidateSlotHeader(g_otaPart);
+        g_mgrUpdateOk = false;
+        return;
+      }
+    }
+
+    esp_err_t err = esp_ota_write(g_otaHandle, up.buf, up.currentSize);
+    if (err != ESP_OK) {
+      g_mgrFailReason = "esp_ota_write failed: 0x" + String(err, HEX);
+      esp_ota_abort(g_otaHandle);
+      invalidateSlotHeader(g_otaPart);
+      g_mgrUpdateOk = false;
+      return;
+    }
+    g_mgrWritten += up.currentSize;
+  }
+
+  else if (up.status == UPLOAD_FILE_END) {
+    if (!g_mgrUpdateAuthed || !g_mgrUpdateOk) return;
+
+    if (g_mgrWritten < MIN_FW_SIZE) {
+      g_mgrFailReason = "File too small (" + String((unsigned)g_mgrWritten) + " bytes) — not valid firmware";
+      esp_ota_abort(g_otaHandle);
+      invalidateSlotHeader(g_otaPart);
+      g_mgrUpdateOk = false;
+      return;
+    }
+
+    esp_err_t err = esp_ota_end(g_otaHandle);
+    if (err != ESP_OK) {
+      g_mgrFailReason = "esp_ota_end (verify) failed: 0x" + String(err, HEX);
+      invalidateSlotHeader(g_otaPart);
+      g_mgrUpdateOk = false;
+      return;
+    }
+
+    // Mark for Hop 2 (checkPendingPromotion(), runs at next boot) and point
+    // the boot target at slot_b so we actually land there on restart.
+    if (lockIO()) {
+      prefs.begin(PREF_NS, false);
+      prefs.putUChar(PREF_PEND_PROMOTE, 1);
+      prefs.putUInt(PREF_PEND_LEN, (uint32_t)g_mgrWritten);
+      prefs.putString(PREF_BOOT_TARGET, TARGET_SLOT_B);
+      prefs.putUChar(PREF_BOOT_FAILS, 0);
+      prefs.end();
+      unlockIO();
+    }
+    Serial.printf("[MGR-UPDATE] Staged %u bytes — will promote to manager on next boot\n", (unsigned)g_mgrWritten);
+  }
+
+  else if (up.status == UPLOAD_FILE_ABORTED) {
+    if (g_mgrUpdateOk) {
+      esp_ota_abort(g_otaHandle);
+      if (g_mgrWritten > 0) invalidateSlotHeader(g_otaPart);
+    }
+    g_mgrUpdateOk = false;
+    g_mgrFailReason = "Upload aborted (connection lost)";
+  }
+}
+
+void handleManagerUpdateDone() {
+  flashInProgress = false;
+
+  if (!g_mgrOriginAuthOk) return;  // checkOrigin()/checkAuth() already sent the response
+
+  if (!g_mgrUpdateOk) {
+    server.send(g_mgrUpdateAuthed ? 400 : 401, "text/plain",
+                g_mgrFailReason.length() ? g_mgrFailReason : "Update failed");
+    return;
+  }
+
+  server.send(200, "text/plain", "Manager firmware staged — rebooting to complete the update...");
+  Serial.println("[MGR-UPDATE] Rebooting to complete self-update");
+  delay(600);
   ESP.restart();
 }
 
@@ -1307,6 +1737,116 @@ void handleNotFound() {
 //   Runs at startup: checks NVS target and either stays in manager mode
 //   or sets the OTA boot partition and restarts into the target slot.
 // ═══════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════
+//   MANAGER SELF-UPDATE — safe two-hop promotion
+// ═══════════════════════════════════════════════════════════════════════════
+// V1.5: the manager can update ITS OWN firmware from the dashboard, but it
+// cannot simply esp_ota_write() into the "manager" (factory) partition while
+// running from that same partition — ESP-IDF's flash-cache mapping means
+// erasing/rewriting flash the CPU is currently executing instructions from
+// is undefined behavior (can crash/hang mid-erase). So a self-update is done
+// in two safe hops, neither of which ever touches the currently-running
+// partition:
+//
+//   Hop 1 (handleManagerUpdateBody(), below): while running from "manager"
+//     (factory) as always, stream the new manager .bin into "slot_b" —
+//     perfectly safe, exactly like a normal slot upload. Mark two NVS flags
+//     (PREF_PEND_PROMOTE + PREF_PEND_LEN) and reboot into slot_b.
+//
+//   Hop 2 (checkPendingPromotion(), here): the NEW manager code is now
+//     running FROM slot_b. Since "manager" (factory) is no longer the
+//     running partition, it's now 100% safe to esp_ota_write() the exact
+//     same bytes into it. On success, esp_ota_set_boot_partition() points
+//     the hardware boot target back at "manager" and restarts — landing
+//     on the updated firmware, running from its permanent home.
+//
+// If anything in Hop 2 fails, the flag is cleared and boot proceeds
+// normally — the device keeps working perfectly fine as "the manager"
+// (just physically executing from slot_b instead of factory) so the user
+// can safely retry the update from Settings; nothing is ever left in a
+// half-flashed or unbootable state.
+void checkPendingPromotion() {
+  prefs.begin(PREF_NS, true);
+  bool     pending = prefs.getUChar(PREF_PEND_PROMOTE, 0) == 1;
+  uint32_t len     = prefs.getUInt(PREF_PEND_LEN, 0);
+  prefs.end();
+  if (!pending) return;
+
+  const esp_partition_t* running = esp_ota_get_running_partition();
+  if (!running || strcmp(running->label, "slot_b") != 0 || len == 0) {
+    // Stale/unexpected flag (e.g. user erased slot_b manually before this
+    // boot completed) — clear it and continue as a completely normal boot.
+    prefs.begin(PREF_NS, false);
+    prefs.putUChar(PREF_PEND_PROMOTE, 0);
+    prefs.end();
+    return;
+  }
+
+  Serial.println("[PROMOTE] Pending manager self-update — copying slot_b → manager");
+  const esp_partition_t* factoryPart = esp_partition_find_first(
+      ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_FACTORY, NULL);
+
+  bool ok = false;
+  if (!factoryPart) {
+    Serial.println("[PROMOTE] ERROR: factory partition not found");
+  } else if (len > factoryPart->size) {
+    Serial.println("[PROMOTE] ERROR: staged image larger than factory partition");
+  } else {
+    esp_ota_handle_t h = 0;
+    // FIX-20 (same class of bug as the upload handler): OTA_SIZE_UNKNOWN so
+    // the erase happens lazily, one sector at a time, interleaved with the
+    // write loop below (which already yields every 1KB) — never one long
+    // blocking erase call that could starve the idle task during boot.
+    esp_err_t err = esp_ota_begin(factoryPart, OTA_SIZE_UNKNOWN, &h);
+    if (err != ESP_OK) {
+      Serial.printf("[PROMOTE] ERROR: esp_ota_begin failed: 0x%X\n", err);
+    } else {
+      uint8_t buf[1024];
+      size_t  off = 0;
+      bool    ioErr = false;
+      while (off < len) {
+        size_t chunk = (len - off > sizeof(buf)) ? sizeof(buf) : (len - off);
+        if (esp_partition_read(running, off, buf, chunk) != ESP_OK) { ioErr = true; break; }
+        if (esp_ota_write(h, buf, chunk) != ESP_OK)                { ioErr = true; break; }
+        off += chunk;
+        delay(1);   // Yield every 1KB — keeps this well clear of any watchdog
+      }
+      if (ioErr) {
+        Serial.println("[PROMOTE] ERROR: read/write failed mid-copy");
+        esp_ota_abort(h);
+      } else if (esp_ota_end(h) != ESP_OK) {
+        Serial.println("[PROMOTE] ERROR: esp_ota_end (image verify) failed");
+      } else if (esp_ota_set_boot_partition(factoryPart) != ESP_OK) {
+        Serial.println("[PROMOTE] ERROR: could not set boot partition to manager");
+      } else {
+        ok = true;
+      }
+    }
+  }
+
+  prefs.begin(PREF_NS, false);
+  prefs.putUChar(PREF_PEND_PROMOTE, 0);
+  prefs.putString(PREF_BOOT_TARGET, TARGET_MANAGER);
+  if (ok) {
+    // slot_b's flash still physically contains a full copy of the manager
+    // image at this point — harmless, but label it clearly instead of
+    // leaving a blank-but-"valid" slot that could confuse the dashboard.
+    prefs.putString(PREF_SLOT_B_NAME, "(manager backup — safe to overwrite)");
+  }
+  prefs.end();
+
+  if (ok) {
+    Serial.println("[PROMOTE] Success — rebooting into updated manager");
+    delay(300);
+    ESP.restart();
+    // Never returns.
+  }
+  Serial.println("[PROMOTE] Failed — continuing to run as manager from slot_b. Retry the update from Settings.");
+  // Falls through to normal boot. PREF_BOOT_TARGET is now "manager", so the
+  // handleBootChain() call right after this will correctly no-op instead of
+  // trying to "chain" into slot_b again.
+}
+
 void handleBootChain() {
   // GPIO 0 LOW at boot = force manager mode regardless of NVS setting
   // GPIO 0 is typically connected to a button on dev boards (BOOT button)
@@ -1384,66 +1924,57 @@ void setup() {
   // so it's guaranteed to exist once the WebServer starts handling requests.
   ioMutex = xSemaphoreCreateMutex();
 
+  // ── Hop 2 of a manager self-update, if one is pending (see the big
+  // comment above checkPendingPromotion()). Must run BEFORE handleBootChain()
+  // so a promotion-in-progress is handled before any normal boot-target
+  // logic runs.
+  checkPendingPromotion();
+
   // ── Boot chain: may restart into a slot ──────────────────────────────────
   handleBootChain();
   // If we reach here, we are in manager mode.
 
-  // ── Load NVS slot names ──────────────────────────────────────────────────
+  // ── Load NVS slot names + settings (AP identity, OTA password) ──────────
   prefs.begin(PREF_NS, true);
-  slotAName = prefs.getString(PREF_SLOT_A_NAME, "");
-  slotBName = prefs.getString(PREF_SLOT_B_NAME, "");
+  slotAName     = prefs.getString(PREF_SLOT_A_NAME, "");
+  slotBName     = prefs.getString(PREF_SLOT_B_NAME, "");
+  apSsid        = prefs.getString(PREF_AP_SSID, AP_SSID_DEFAULT);
+  apPass        = prefs.getString(PREF_AP_PASS, AP_PASS_DEFAULT);
+  otaUpdatePass = prefs.getString(PREF_OTA_PASS, OTA_PASS_DEFAULT);
   prefs.end();
   Serial.println("[NVS] Slot A: " + (slotAName.length() ? slotAName : "(empty)"));
   Serial.println("[NVS] Slot B: " + (slotBName.length() ? slotBName : "(empty)"));
 
-  // ── WiFi ─────────────────────────────────────────────────────────────────
-  Serial.print("[WiFi] Connecting to: ");
-  Serial.println(WIFI_SSID);
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  // ── WiFi — V1.5: fully offline. This device never joins another network;
+  // it always runs its own Access Point so it works anywhere with zero
+  // router/internet dependency. ──────────────────────────────────────────
+  apMode = true;
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(apSsid.c_str(), apPass.c_str());
+  Serial.println("[AP]   SSID: " + apSsid);
+  Serial.println("[AP]   IP:   " + WiFi.softAPIP().toString());
 
-  int tries = 0;
-  while (WiFi.status() != WL_CONNECTED && tries < 30) {
-    delay(500);
-    Serial.print(".");
-    tries++;
-  }
-  if (WiFi.status() == WL_CONNECTED) {
-    apMode = false;
-    Serial.println("\n[WiFi] Connected! IP: " + WiFi.localIP().toString());
-  } else {
-    apMode = true;
-    WiFi.mode(WIFI_AP);
-    WiFi.softAP(AP_SSID, AP_PASS);
-    Serial.println("\n[WiFi] STA failed → AP mode");
-    Serial.println("[AP]   SSID: " + String(AP_SSID) + "  Pass: " + String(AP_PASS));
-    Serial.println("[AP]   IP:   " + WiFi.softAPIP().toString());
-
-    // FEATURE: captive portal — answer every DNS query on the AP with our
-    // own IP, so any hostname a connecting phone tries to resolve (used by
-    // its captive-portal probe) points straight back at us.
-    dnsServer.start(DNS_PORT, "*", WiFi.softAPIP());
-    Serial.println("[DNS] Captive portal DNS started — connect to AP and the dashboard should open automatically");
-  }
-
-  // Explicitly collect Content-Length so handleUploadBody() can read the
-  // real upload size via server.header("Content-Length") — WebServer does
-  // not expose headers unless they're requested up front like this.
-  const char* headersToCollect[] = { "Content-Length" };
-  server.collectHeaders(headersToCollect, 1);
+  // Captive portal: answer every DNS query on the AP with our own IP, so any
+  // hostname a connecting phone tries to resolve (used by its captive-portal
+  // probe) points straight back at us and the dashboard opens automatically.
+  dnsServer.start(DNS_PORT, "*", WiFi.softAPIP());
+  Serial.println("[DNS] Captive portal DNS started — connect to the AP and the dashboard should open automatically");
 
   // ── Register routes ───────────────────────────────────────────────────────
-  server.on("/",                HTTP_GET,  handleRoot);
-  server.on("/status",          HTTP_GET,  handleStatus);
-  server.on("/boot-slot",       HTTP_POST, handleBootSlot);
-  server.on("/erase-slot",      HTTP_POST, handleEraseSlot);
-  server.on("/upload",          HTTP_POST, handleUploadDone, handleUploadBody);
+  server.on("/",                    HTTP_GET,  handleRoot);
+  server.on("/status",               HTTP_GET,  handleStatus);
+  server.on("/boot-slot",            HTTP_POST, handleBootSlot);
+  server.on("/erase-slot",           HTTP_POST, handleEraseSlot);
+  server.on("/upload",               HTTP_POST, handleUploadDone, handleUploadBody);
+  server.on("/settings",             HTTP_GET,  handleGetSettings);
+  server.on("/settings/ap",          HTTP_POST, handleSetAP);
+  server.on("/settings/ota-password",HTTP_POST, handleChangeOtaPass);
+  server.on("/manager-update",       HTTP_POST, handleManagerUpdateDone, handleManagerUpdateBody);
   server.onNotFound(handleNotFound);
 
   server.begin();
   Serial.println("[Server] Running on port 80");
-  String ip = apMode ? WiFi.softAPIP().toString() : WiFi.localIP().toString();
-  Serial.println("[Server] Open in browser: http://" + ip);
+  Serial.println("[Server] Open in browser: http://" + WiFi.softAPIP().toString());
   Serial.println("===========================================\n");
 }
 
